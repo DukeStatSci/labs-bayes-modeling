@@ -1,0 +1,225 @@
+---
+title: "STA 601 Lab 3: Posterior Predictive Checks"
+author: "STA 601: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+```{r install, eval = F}
+# only run once
+install.packages("bayesplot")
+install.packages("loo")
+install.packages("readxl")
+```
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+require(rstan)
+require(bayesplot)
+require(loo)
+require(readxl)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+# Data
+
+The data we have are counts of deaths per episode of Game of Thrones.
+```{r load_data}
+GoT <- read_xlsx("GoT_Deaths.xlsx", col_names = T)
+head(GoT)
+```
+
+***
+### Exercise
+
+Plot a histogram of the death counts. 
+
+```{r}
+ggplot(GoT, aes(x = Count))+
+  geom_histogram(bins = 25, fill = "#deebf7") +
+  labs(x = "Number of deaths", y = "Count")
+```
+
+***
+
+Because we have count data, it is natural to model the data with a Poisson distribution. If we take the empirical mean of the data as our estimate for $\lambda$, what does the sampling distribution look like?
+
+```{r}
+y <- GoT$Count
+n <- length(y)
+
+# Finish: obtain empirical mean
+ybar <- mean(y)
+sim_dat <- rpois(n, ybar)
+qplot(sim_dat, bins = 20, xlab = "Simulated number of deaths", fill = I("#9ecae1"))
+
+# create data frame for side-by-side histograms
+df <- rbind(data.frame(y, "observed") %>% rename(count = 1, data = 2),
+            data.frame(sim_dat, "simulated") %>% rename(count = 1, data = 2))
+ggplot(df, aes(x = count, fill = data))+
+  geom_histogram(position = "dodge", bins = 20) +
+  scale_fill_brewer()  +
+  labs(x = "Number of deaths", y = "Count")
+```
+
+Plotting the histogram of the data next to the histogram of the sampled data using $\hat{\lambda} = \bar{y}$, we see that there are many more 0-valued observations in the observed data than there are in the simulated data. We might suspect that the Poisson model will not be a good fit for the data. For now, let's proceed using the Poisson model and see how it behaves.
+
+# Fit Poisson model
+
+We have learned that the Gamma distribution is conjugate for Poisson data. Here, we have chosen the prior $\lambda \sim Gamma(10,2)$ based on prior knowledge that Game of Thrones is a show filled with death. We run the model in Stan. We save the posterior sampled values of $\lambda$ in the variable `lambda_draws'. 
+
+```{r basic_mod}
+stan_dat <- list(y = y, N = n)
+fit <- stan("poisson-simple.stan", data = stan_dat, refresh = 0, chains = 2)
+lambda_draws <- as.matrix(fit, pars = "lambda")
+```
+
+***
+### Exercise
+
+Use the function `mcmc_areas()` to plot the smoothed posterior distribution for $\lambda$ with a 90\% Highest Posterior Density region. Changing the `prob` parameter in `mcmc_areas()` will change the amount of probability mass that is highlighted. The highlighted region will begin in regions of highest density, and will move towards regions of lower density as `prob` gets larger.
+
+```{r}
+mcmc_areas(lambda_draws, prob = 0.9)
+print(fit, pars = "lambda")
+```
+
+The line in the plot represents the posterior mean, and the shaded area represents 90\% of the posterior density. How does the posterior mean for $\lambda$ compare to the sample mean?
+
+***
+
+# Graphical Posterior Predictive Checks (PPC)
+
+***
+### Exercise
+
+Generate posterior predictive samples using the posterior values of $\lambda$ and store the result in a `length(lambda_draws)` by `n` matrix.
+
+```{r y_rep}
+y_rep <- matrix(NA, nrow = length(lambda_draws), ncol = n)
+for(i in 1:length(lambda_draws)){
+  # Finish generating posterior predictive samples
+  y_rep[i,] <- rpois(n, lambda_draws[i])
+}
+```
+
+***
+
+We now step through some graphical posterior predictive checks. Here we plot the histogram of the observed counts against several of the posterior predictions. What do you notice?
+
+```{r}
+ppc_hist(y, y_rep[1:8, ], binwidth = 1)
+```
+
+We can compare the density estimate of $y$ to the density estimates for several (60) of the $y_rep$s. What do you notice here?
+
+```{r}
+ppc_dens_overlay(y, y_rep[1:60, ])
+```
+
+In our first histogram of the data, we noticed the high number of 0 counts. Let us calculate the proportion of zeros in $y$, and compare that to the propotion of zeros in all of the posterior predictive samples.
+
+```{r}
+prop_zero <- function(x){
+  mean(x == 0)
+} 
+prop_zero(y)
+ppc_stat(y, y_rep, stat = "prop_zero")
+```
+
+We can plot the means and variances for all of the simulated datasets, along with the observed statistics.
+
+```{r}
+ppc_stat_2d(y, y_rep, stat = c("mean", "var"))
+ppc_error_hist(y, y_rep[1:4, ], binwidth = 1) + xlim(-15, 15)
+```
+
+***
+### Exercise
+
+Based on on these PPCs, does this model appear to be a good fit for the data?
+
+***
+
+# Poisson Hurdle Model
+
+How should we account for the high frequency of zeros? As it turns out, there is a lot of literature on how to work with this sort of data. We can fit a zero-inflated Poisson model, where the data is modelled as a mixture of a Poisson distribution with a point mass at zero. Here, we fit a hurdle model: $y_i = 0$ with probability $\theta$, and $y_i > 0$ with probability $1-\theta$. Conditional on having observed $y_i$ nonzero, we model $y_i$ with a Poisson distribution which is truncated from below with a lower bound of 1. For the truncated Poisson, we use the same $Gamma(10,2)$ prior as in the simple Poisson model above.
+
+***
+### Exercise
+
+Using the code provided for the simple Poisson model, simluate draws from the posterior density of $\lambda$ with the "Poisson Hurdle" model. The Stan file you'll need to use is called `poisson-hurdle.stan`. Store the resulting object in a variable called `fit2`.
+
+```{r}
+fit2 <- stan("poisson-hurdle.stan", data = stan_dat, chains = 2, refresh = 0)
+print(fit2, pars = c("lambda", "theta"))
+```
+
+***
+
+Here we compare the posterior densities of $\lambda$ from the simple Poisson model and the Poisson hurdle model.
+
+```{r}
+# Extract the sampled vlaues for lambda, and store them in a variable called lambda_draws2:
+lambda_draws2 <- as.matrix(fit2, pars = "lambda")
+
+# Compare
+lambdas <- cbind(lambda_fit1 = lambda_draws[, 1],
+                 lambda_fit2 = lambda_draws2[, 1])
+
+# Shade 90% interval
+mcmc_areas(lambdas, prob = 0.9) 
+```
+
+Obtaining posterior samples from the hurdle model is more complicated, so the Stan file includes code to draw from the posterior predictive distribution for you. We extract them here, and store the predictive samples in `y_rep2'.
+
+```{r}
+y_rep2 <- as.matrix(fit2, pars = "y_rep")
+```
+
+***
+### Exercise
+
+Use the code given above to produce the same PPC visualizations as before for the new results. Comment on how this second model compares to both the observed data and to the simple Poisson model.
+
+```{r}
+ppc_hist(y, y_rep2[1:8, ])
+ppc_dens_overlay(y, y_rep2[1:60, ])
+ppc_stat(y, y_rep2, stat = "prop_zero")
+ppc_stat_2d(y, y_rep2, stat = c("mean", "var"))
+ppc_error_hist(y, y_rep2[1:4, ], binwidth = 1) + xlim(-15, 15)
+```
+
+***
+
+# Leave-one-out cross-validation 
+
+Here, we assess the predictive performance of both models with leave-one-out cross-validation (LOOCV). LOOCV holds out a single observation form the sample, fits the model on the remaining observations, uses the held out data point as validation, and calculates the prediction error. This process is repeated $n$ times, such that each observation has been held out exactly once. We make use of the handy loo() function, and compare the two models:
+
+```{r}
+log_lik1 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff1 <- relative_eff(exp(log_lik1)) 
+(loo1 <- loo(log_lik1, r_eff = r_eff1))
+
+log_lik2 <- extract_log_lik(fit2, merge_chains = FALSE)
+r_eff2 <- relative_eff(exp(log_lik2)) 
+(loo2 <- loo(log_lik2, r_eff = r_eff2))
+
+compare(loo1, loo2)
+```
+
+Which model performs better in terms of prediction?
+
+# Wrapping up
+
+Some final questions to consider:
+
+1. Why are PPCs important? 
+2. Was the second model a good fit for the data? Why or why not?
+3. If someone reported a single LOOCV error to you, would that be useful? Why or why not?
+
+*Adapted from this [tutorial](http://avehtari.github.io/BDA_R_demos/demos_rstan/ppc/poisson-ppc.html)

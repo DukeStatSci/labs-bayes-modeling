@@ -1,0 +1,338 @@
+---
+title: "STA 360 Lab 6a: Missing data and imputation"
+author: "STA 360: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(magrittr)
+require(mvtnorm)
+library(cowplot)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+# Introduction
+
+In today's lab, we will (1) quickly review some properties of the **Multivariate Normal** distribution and (2) work through Hoff, Exercise 7.5, on **Multiple Imputation**. Multiple Imputation is a strategy for handling missing data when the mechanism that determines whether the data are missing or not depends on the observed data values.
+
+# Multivariate normal theory
+
+Suppose the random variables $Y_1$ and $Y_2$ have joint probability distribution described by the mean-zero, covariance $\Sigma$ bivariate normal density function:
+
+$$
+p_{Y_1,Y_2 | \Sigma}(y_1, y_2 | \Sigma) = \left( 2 \pi |\Sigma| \right)^{-1} \text{exp} \left({-\frac{1}{2}\left[\begin{array}{cc}y_1&y_2\end{array}\right] \Sigma^{-1}\left[\begin{array}{c}y_1\\y_2\end{array}\right]}\right)
+$$
+
+If we move to vector notation, writing 
+
+$$
+Y = \left[\begin{array}{c}y_1\\y_2\end{array}\right]
+$$
+
+then the density function can be re-expressed more compactly as
+
+$$
+p_{Y | \Sigma}(y | \Sigma) = \left( 2 \pi |\Sigma| \right)^{-1} \text{exp} \left({-\frac{1}{2}Y^T \Sigma^{-1}Y}\right)
+$$
+
+If instead we want to describe the distribution of a $p$-dimensional multivariate normal random vector $Y = [y_1 ~~y_2 ~~\dots ~~y_p]$ with mean parameter $\theta = [\theta_1 ~~\theta_2 ~~\dots ~~\theta_p]$ and covariance matrix $\Sigma \in \mathbb{R}^{p \times p}$, then we write
+
+$$
+p_{Y | \theta, \Sigma}(y | \theta, \Sigma) = \left( 2 \pi |\Sigma| \right)^{-p/2} \text{exp} \left({-\frac{1}{2}(Y - \theta)^T \Sigma^{-1}(Y - \theta)}\right)
+$$
+
+## Marginals and conditionals
+
+The multivariate normal disribution has some nice properties. Let's state and verify them:
+
+> The marginal distribution $p_{Y_1}(y_1) = \int_{y_2, \dots, y_p} p_{Y | \theta, \Sigma}(y | \theta, \Sigma) dy_2\cdots dy_p$ is univariate normal
+
+***
+### Exercise
+
+Show that the above statement is true.
+
+***
+
+In fact, for any subset $\mathcal{J} \subset \{1, \dots, p\}$ the marginal distribution $p_{Y_{j \in \mathcal{J}}}(y_{j \in \mathcal{J}})$ will be multivariate normal with dimension $|\mathcal{J}|$. In addition,
+
+> The conditional distribution $p_{Y_1 | Y_2,\dots, Y_p}(y_1 | y_2, \dots, y_p)$ is univariate normal.
+
+***
+### Exercise 
+
+Show that the above statement is true.
+
+***
+
+Note that this holds -- replacing "univariate" with "multivariate" -- for any $p_{Y_{j \in \mathcal{J}} | Y_{j \notin \mathcal{J}}}(y_{j \in \mathcal{J}} | y_{j \notin \mathcal{J}})$
+
+## Simulating multivariate normals in `R`
+
+The `R` package, `mvtnorm`, contains functions for evaluating and simulating from a multivariate normal density.
+
+We can simulate a single multivariate normal random vector using the `rmvnorm` function.
+
+```{r}
+rmvnorm(n = 1, mean = rep(0, 2), sigma = diag(2))
+```
+
+
+We can evaluate the multivariate normal density at a single value using the `dmvnorm` function.
+
+```{r}
+dmvnorm(rep(0, 2), mean = rep(0, 2), sigma = diag(2))
+```
+
+We can simulate several multivariate normal random vectors using the `rmvnorm` function.
+
+```{r}
+rmvnorm(n = 3, mean = rep(0, 2), sigma = diag(2))
+```
+
+Each row is a different sample from this multivariate normal distribution.
+
+We can evaluate the multivariate normal density at several values using the `dmvnorm` function.
+```{r}
+dmvnorm(rbind(rep(0, 2), rep(1, 2), rep(2, 2)), 
+        mean = rep(0, 2), sigma = diag(2))
+```
+
+The `R` package, `stats`, contains functions for evaluating and simulating from a Wishart density. We can simulate a single Wishart distributed matrix using the `rWishart` function.
+
+```{r}
+nu0 <- 2
+Sigma0 <- diag(2)
+rWishart(1, df = nu0, Sigma = Sigma0)[, , 1]
+```
+
+We can simulate a single inverse-Wishart distributed matrix using the `rWishart` function as well.
+
+```{r}
+nu0 <- 2
+Sigma0 <- diag(2)
+solve(rWishart(1, df = nu0, Sigma = solve(Sigma0))[, , 1])
+```
+
+# Multiple imputation
+
+Hoff, Exercise 7.5, presents us with multivariate normal data with observations *missing at random* (MAR). Recall the definition of MAR data:
+
+> If the probability that a data point is missing depends on some/all of the observed data, but is independent of the values of any unobserved (missing) data, then it is said to be **missing at random**.
+
+Contrast this with data missing completely at random, whose "missingness" mechanism is independent of any data values, whether they are observed or unobserved. 
+
+Data for Exercise 7.5 can be downloaded from the [Data Section of the Website](https://www.stat.washington.edu/~pdhoff/Book/Data/hwdata/).
+
+```{r}
+data <- read.table("http://www.stat.washington.edu/~pdhoff/Book/Data/hwdata/interexp.dat",
+                   header=TRUE, na.strings="NA")
+head(data)
+```
+
+This data gives measurements from two experiments (A and B), for `r nrow(data)` subjects. The goal of the experiment is to assess if measurements from experiment A are different from measurements from experiment B. Apparently, the experiment was interrupted and `r nrow(data[!complete.cases(data),])` subjects are missing either experiment A or B measurements. These measurements can be imputed before comparing measurements from A and B.
+
+Assume that the complete data are drawn from a multivariate normal distribution,
+
+$$
+\left(\begin{array}{c}Y^{\left(A\right)}_{i} \\ Y^{\left(B\right)}_{i}\end{array}\right) |  \boldsymbol \theta, \Sigma \sim \text{Multivariate Normal}\left(\boldsymbol \theta, \Sigma\right),
+$$
+
+where $\boldsymbol \theta$ and $\Sigma$ are unknown and
+
+$$
+\Sigma = \left(\begin{array}{cc}
+\sigma^2_A & \rho\sigma_A\sigma_B \\
+\rho\sigma_A\sigma_B & \sigma^2_B
+\end{array}\right).
+$$
+
+Also assume that
+
+$$
+Y^{\left(A\right)}_i |Y^{\left(B\right)}_i, \boldsymbol \theta, \Sigma  \sim \text{Normal}\left(\theta_A + \frac{\rho \sigma_A}{\sigma_B}\left(Y^{\left(B\right)}_i - \theta_B\right), \sigma^2_A\left(1 - \rho^2\right)\right),
+$$
+
+and
+
+$$
+Y^{\left(B\right)}_i |Y^{\left(A\right)}_i, \boldsymbol \theta, \Sigma  \sim \text{Normal}\left(\theta_B + \frac{\rho \sigma_B}{\sigma_A}\left(Y^{\left(A\right)}_i - \theta_A\right), \sigma^2_B\left(1 - \rho^2\right)\right).
+$$
+
+In the "simple" imputation strategy, use simple moment estimators to estimate the unknown parameters.
+
+```{r}
+theta.A.hat <- mean(data$yA, na.rm = TRUE)
+theta.B.hat <- mean(data$yB, na.rm = TRUE)
+sigma.sq.A.hat <- var(data$yA, na.rm = TRUE)
+sigma.sq.B.hat <- var(data$yB, na.rm = TRUE)
+rho.hat <- cor(data$yA, data$yB, use = "complete.obs")
+```
+
+Then impute the missing experiment measurements by plugging the moment estimators into the expressions for the conditional means,
+
+$$
+\theta_A + \frac{\rho \sigma_A}{\sigma_B}\left(Y^{\left(B\right)}_i - \theta_B\right)\text{, } \theta_B + \frac{\rho \sigma_B}{\sigma_A}\left(Y^{\left(A\right)}_i - \theta_A\right)
+$$
+
+```{r}
+imp1 <- data
+miss.A <- which(is.na(data$yA))
+miss.B <- which(is.na(data$yB))
+
+for (i in miss.A) {
+  imp1[i, "yA"] <- theta.A.hat + 
+    rho.hat*sqrt(sigma.sq.A.hat/sigma.sq.B.hat)*(imp1[i, "yB"] - theta.B.hat)
+}
+for (i in miss.B) {
+  imp1[i, "yB"] <- theta.B.hat + 
+    rho.hat*sqrt(sigma.sq.B.hat/sigma.sq.A.hat)*(imp1[i, "yA"] - theta.A.hat)
+}
+```
+
+Having performed this imputation strategy, we can use a paired sample t-test on measurements from experiments A and B and obtain a 95% confidence interval for $\theta_A - \theta_B$.
+
+```{r}
+t.test(imp1[, "yA"], imp1[, "yB"], paired = TRUE)
+```
+
+The simple imputation strategy allowed us to use data from all of the subjects. However, it ignored the variability of the unobserved data. A better strategy would be to perform multiple imputation using a sampling strategy.
+
+First, assume a unit information prior for the unknown parameters:
+
+$$
+\begin{aligned}
+\boldsymbol \theta &\sim \text{Multivariate Normal}\left(\sum_{i = 1}^{n_c} \boldsymbol y_i/n_c, \Sigma\right) \\
+\Sigma^{-1} &\sim \text{Wishart}\left(3, S^{-1} \right),
+\end{aligned}
+$$
+
+where 
+
+$$
+S = \sum_{i = 1}^{n_c} \left(\boldsymbol y_i -\bar{\boldsymbol y} \right)\left(\boldsymbol y_i -\bar{\boldsymbol y} \right)^T/n_c.
+$$
+
+and assume the first $n_c$ subjects have complete data. For fixed $\boldsymbol \theta$, $\Sigma$, the sampling model for the *full* data $Y$ is:
+$$
+\begin{aligned}
+Y^{\left(A\right)}_i |Y^{\left(B\right)}_i, \boldsymbol \theta, \Sigma  &\sim \text{Normal}\left(\theta_A + \frac{\rho \sigma_A}{\sigma_B}\left(Y^{\left(B\right)}_i - \theta_B\right), \sigma^2_A\left(1 - \rho^2\right)\right),\\
+Y^{\left(B\right)}_i |Y^{\left(A\right)}_i, \boldsymbol \theta, \Sigma  &\sim \text{Normal}\left(\theta_B + \frac{\rho \sigma_B}{\sigma_A}\left(Y^{\left(A\right)}_i - \theta_A\right), \sigma^2_B\left(1 - \rho^2\right)\right).
+\end{aligned}
+$$
+
+Then full conditional distributions for $\theta$ and $\Sigma$ under this model are:
+
+$$
+\begin{aligned}
+\boldsymbol \theta | \Sigma, Y \sim \text{Multivariate Normal}\left(\bar{\boldsymbol y}, \Sigma/\left(n + 1\right)\right)
+\end{aligned}
+$$
+
+and
+
+$$
+\begin{aligned}
+\Sigma | \boldsymbol \theta, Y \sim \text{Inverse-Wishart}\left(p + n + 2, S^{-1} + n S_{y}^{-1} + S_{\theta}^{-1}\right),
+\end{aligned}
+$$
+
+where $S_{y}^{-1} = \sum_{i = 1}^n \left(\boldsymbol y_i - \boldsymbol \theta \right)\left(\boldsymbol y_i - \boldsymbol \theta \right)^T/n$ and $S_{\theta}^{-1} = \left(\bar{\boldsymbol y} - \boldsymbol \theta \right)\left(\bar{\boldsymbol y} - \boldsymbol \theta \right)^T$.
+
+Now, take a moment to recognize that we can (and will) treat any missing data points as if they were model parameters on which we needed to do inference. For the missing data, the *sampling model is a full conditional distribution*. Gibbs sampling to approximate the imputed values under this model.
+
+```{r}
+# Set Prior Parameters
+y.bar <- apply(data, 2, mean, na.rm = TRUE)
+complete <- which(complete.cases(data))
+n.complete <- length(complete)
+S <- (t(data[complete, ]) - y.bar)%*%t(t(data[complete, ]) - y.bar)/n.complete
+nu.0 <- nrow(S) + 1
+n <- nrow(data)
+
+samps <- 10000
+y.A.samps <- y.B.samps <- matrix(nrow = samps, ncol = n)
+theta.samps <- matrix(nrow = samps, ncol = 2)
+
+# Set Starting values
+Sigma <- S
+theta <- y.bar
+Y <- as.matrix(imp1)
+```
+
+
+```{r}
+for (i in 1:samps) {
+  
+  # Update theta
+  y.bar.samp <- apply(Y, 2, mean)
+  theta <- rmvnorm(1, y.bar.samp, Sigma/(n + 1))
+  theta.samps[i, ] <- theta
+  
+  # Update Sigma
+  S.n <- S + t(Y - c(theta))%*%(Y - c(theta)) + t(t(c(theta) - y.bar.samp))%*%t(c(theta) - y.bar.samp)
+  Sigma <- solve(rWishart(1, nu.0 + n + 1, solve(S.n))[, , 1])
+  rho <- cov2cor(Sigma)[1, 2]
+  sigma.sq.A <- Sigma[1, 1]
+  sigma.sq.B <- Sigma[2, 2]
+  
+  # Update Missing Data
+  for (j in miss.A) {
+    Y[j, 1] <- rnorm(1, 
+                        theta[1] + (rho*sqrt(sigma.sq.A/sigma.sq.B))*(Y[j, "yB"] - theta[2]),
+                        sqrt(sigma.sq.A*(1 - rho^2)))
+  }
+  for (j in miss.B) {
+    Y[j, 2] <- rnorm(1, 
+                        theta[2] + (rho*sqrt(sigma.sq.B/sigma.sq.A))*(Y[j, "yA"] - theta[1]),
+                        sqrt(sigma.sq.B*(1 - rho^2)))
+  }
+  y.A.samps[i, ] <- Y[, 1]
+  y.B.samps[i, ] <- Y[, 2]
+}
+```
+
+
+Now we can evaluate $\theta_A - \theta_B$ from the posterior by computing a posterior mean and 95\% credible interval.
+
+```{r}
+mean(theta.samps[1, ] - theta.samps[, 2])
+quantile(theta.samps[1, ] - theta.samps[, 2], c(0.025, 0.975))
+```
+
+***
+### Exercise
+
+Compare these results to those of the t-test from the simple imputation strategy. How do they differ? Why do they differ?
+
+***
+
+Given can get new imputed values by taking the posterior means of sampled missing values.
+
+```{r}
+imp2 <- cbind(apply(y.A.samps, 2, mean),
+              apply(y.B.samps, 2, mean))
+```
+
+```{r, fig.align='center', fig.width=5, fig.height=5}
+plot(imp1[, 1], imp1[, 2], xlab = expression(y[A]), 
+     ylab = expression(y[B]), 
+     main = "Comparison of Imputed Values")
+points(imp2[, 1], imp2[, 2], col = "red", pch = 2)
+abline(a = 0, b = 1)
+legend("bottomright", pch = c(1, 2), col = c("black", "red"), legend = c("Simple", "Multiple"))
+```
+
+***
+### Exercise
+
+Following the code used above, repeat the multiple imputation analysis using Jeffrey's prior instead of the Unit Information Prior. How do your posterior mean and 95\% credible intervals compare?
+
+***
+
+*This lab was adapted from a previous STA 601 lab presentation written by [Maryclare Griffin](https://maryclare.github.io).

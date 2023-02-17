@@ -1,0 +1,223 @@
+---
+title: "STA 360 Lab 5a: Inference in Gaussian models"
+author: "STA 360: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+require(rstan)
+require(bayesplot)
+require(loo)
+require(readxl)
+require(plyr)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+set.seed(51)
+```
+
+# Overview
+
+The Gaussian or Normal model is ubiquitous in statistical modeling of continuous-valued data. Therefore, if one can become comfortable with the procedures involved in Bayesian inference under the Gaussian sampling model, one can rightfully claim to have some basic fluency in a wide array of related statistical models.
+
+In this lab, we will build your fluency in Gaussian models using a classic pedagogical method known as "**brute force**." In brute force, one learns a set of techniques by "*doing*" each technique, sometimes more than once. So, to learn how to do inference in Gaussian models, we will "do" several posterior inference procedures using Gaussian sampling models and their respective conjugate prior distributions for mean and variance parameters.
+
+We begin with the univariate Normal likelihood:
+
+# Normal likelihood
+
+$$
+p_{X | \mu, \sigma^2}(x) = \frac{1}{\sqrt{2\pi \sigma^2}} e^{-\frac{(x-\mu)^2}{2\sigma^2}}
+$$
+
+## Inference on mean $\mu$ with known variance $\sigma^2$
+
+```{r, fig.height=3}
+mu <- c(-2, 0, 1.8)
+sigma <- 1
+par(mfrow = c(1, 3))
+for(i in 1:3){
+  x <- seq(-6, 6, length.out = 1000)
+  y <- dnorm(x, mean = mu[i], sd = sigma)
+  plot(x, y, type = 'l', xlab = "X", ylab = "")
+  abline(v = mu[i], lty = 3, col = "#a50f15")
+  abline(v = c(mu[i] + sigma, mu[i] - sigma), lty = 1, col ="black")
+}
+```
+
+### Conjugate prior
+
+As a function of $\mu$ alone, the Normal likelihood function is proportional to a Normal density function.
+
+$$
+p_{\mu | \tau, \sigma_0^2} (\mu) = \frac{1}{\sqrt{2 \pi \sigma_0^2}} e^{-\frac{(\mu - \tau)^2}{2 \sigma_0^2}}
+$$
+
+### Posterior update
+
+$$
+\begin{aligned}
+p_{\mu | X_1, \dots, X_n, \sigma^2} &\propto p_{X_1, \dots, X_n | \mu, \sigma^2}(x_1, \dots, x_n) \cdot p_{\mu | \tau, \sigma_0^2} (\mu) \\
+&\propto e^{-\frac{\sum_{i=1}^n (x_i-\mu)^2}{2\sigma^2}} \cdot e^{-\frac{(\mu - \tau)^2}{2 \sigma_0^2}} \\
+&= e^{-\frac{\sigma_0^2(\sum_{i=1}^n x_i^2 - 2\mu \sum_{i=1}^n x_i + n\mu^2) + \sigma^2(\mu^2 - 2 \mu \tau + \tau^2)}{2\sigma^2 \sigma_0^2}} \\
+&\propto e^{-\frac{(n\sigma_0^2+\sigma^2) \mu^2 - 2 (\sigma^2 \tau + \sigma_0^2 \sum_{i=1}^n x_i) \mu}{2\sigma^2 \sigma_0^2}} \\
+&= e^{-\frac{\mu^2 - 2 \big(\frac{\sigma^2 \tau + \sigma_0^2\sum_{i=1}^n x_i}{n\sigma_0^2+\sigma^2}\big) \mu}{2 \big(\frac{\sigma^2 \sigma_0^2}{n\sigma_0^2+\sigma^2} \big)}} \\
+&= e^{-\frac{\mu^2 - 2 \bigg(\frac{\frac{\tau}{\sigma_0^2} + \frac{\sum_{i=1}^n x_i}{\sigma^2}}{\frac{n}{\sigma^2}+\frac{1}{\sigma_0^2}}\bigg) \mu}{2 \big(\frac{n}{\sigma^2}+\frac{1}{\sigma_0^2} \big)^{-1}}} \\
+&\propto \text{Normal}\bigg(\Big( \frac{n}{\sigma^2} + \frac{1}{\sigma_0^2} \Big)^{-1}\Big(\frac{n}{\sigma^2} \bar{x} + \frac{1}{\sigma_0^2} \tau \Big), \Big(\frac{n}{\sigma^2} + \frac{1}{\sigma_0^2}\Big)^{-1} \bigg)
+\end{aligned}
+$$
+
+## Inference on variance $\sigma^2$ with known mean $\mu$
+
+```{r, fig.height=3}
+mu <- 0
+sigmasq_inv <- c(0.25, 1, 1.7)
+par(mfrow = c(1, 3))
+for(i in 1:3){
+  x <- seq(-6, 6, length.out = 1000)
+  y <- dnorm(x, mean = 0, sd = sqrt(1/sigmasq_inv[i]))
+  plot(x, y, type = 'l', xlab = "X", ylab = "")
+  abline(v = 0, lty = 1, col = "black")
+  abline(v = c(-sqrt(1/sigmasq_inv[i]), sqrt(1/sigmasq_inv[i])), lty = 3, col = "#a50f15")
+}
+```
+
+### Conjugate prior
+
+As a function of $1 / \sigma^2$ alone, the Normal likelihood function is proportional to a Gamma density function.
+
+$$
+p_{1/\sigma^2 | \alpha, \beta}(1/\sigma^2) = \frac{\beta^\alpha}{\Gamma(\alpha)} \Big(\frac{1}{\sigma^2}\Big)^{\alpha - 1} e^{- \frac{\beta}{\sigma^2}}
+$$
+
+### Posterior update
+
+$$
+\begin{aligned}
+p_{1 / \sigma^2 | X_1, \dots, X_n, \mu}(1 / \sigma^2) &\propto p_{X_1, \dots, X_n | \mu, 1 / \sigma^2}(x_1, \dots, x_n) \cdot p_{1/\sigma^2 | \alpha, \beta}(1/\sigma^2) \\
+&\propto \Big(\frac{1}{\sigma^2}\Big)^{n/2} e^{-\frac{\sum_{i=1}^n (x_i-\mu)^2}{2\sigma^2}} \Big(\frac{1}{\sigma^2}\Big)^{\alpha - 1} e^{- \frac{\beta}{\sigma^2}} \\
+&= \Big(\frac{1}{\sigma^2}\Big)^{\alpha + n/2 - 1} e^{-\frac{\beta + \frac{1}{2}\sum_{i=1}^n(x_i-\mu)^2}{\sigma^2}} \\
+&\propto \text{Gamma}\bigg(\alpha + n/2, \beta + \frac{1}{2}\sum_{i=1}^n(x_i-\mu)^2 \bigg)
+\end{aligned}
+$$
+
+# Multivariate normal likelihood
+
+$$
+p_{\mathbf{X} | \mu, \Sigma}(\mathbf{x}) = \frac{1}{\sqrt{2 \pi |\Sigma|}} e^{-\frac{(\mathbf{x} - \mu)^T \Sigma^{-1} (\mathbf{x} - \mu) }{2}}
+$$
+
+## Inference on mean vector $\mu$ with known covariance matrix $\Sigma$
+
+```{r, fig.height=3}
+D2Norm <- function(x, mu, Sigma){
+  n <- length(mu)
+  res <- rep(0, nrow(x))
+  for(i in 1:nrow(x)){
+    res[i] <- (1 / (2*pi*det(Sigma)))*exp((-1/2)*t(x[i, ] - mu)%*%MASS::ginv(Sigma)%*%(x[i, ] - mu))
+  }
+  return(res)
+}
+mu <- matrix(c(-1, 0, 2, -1, 0.4, 2), nrow = 2)
+Sigma <- matrix(c(2, 1.4, 1.4, 2), nrow = 2)
+par(mfrow = c(1, 3))
+for(i in 1:3){
+  x <- seq(-5, 5, length.out = round(sqrt(500)))
+  ex <- expand.grid(x, x) %>% dplyr::arrange(Var1, Var2)
+  contour(x = x, y = x, t(matrix(D2Norm(as.matrix(ex), mu[,i], Sigma), nrow = round(sqrt(500)))),
+          xlab = expression(X[1]), ylab = expression(X[2]))
+  eig_sig <- eigen(Sigma)
+  arrows(x0 = mu[1,i], y0 = mu[2,i], 
+         x1 = mu[1,i] + sqrt(eig_sig$values[1])*eig_sig$vectors[1,1],
+         y1 = mu[2,i] + sqrt(eig_sig$values[1])*eig_sig$vectors[2,1],
+         length = 0.1, lwd = 2.5)
+  arrows(x0 = mu[1,i], y0 = mu[2,i], 
+         x1 = mu[1,i] + sqrt(eig_sig$values[2])*eig_sig$vectors[1,2],
+         y1 = mu[2,i] + sqrt(eig_sig$values[2])*eig_sig$vectors[2,2],
+         length = 0.1, lwd = 2.5)
+  points(mu[1,i], mu[2,i], col = "#a50f15", cex = 2.5, pch = 16)
+}
+```
+
+### Conjugate prior
+
+As a function of $\mu$ alone, the Multivariate Normal likelihood function is proportional to a Multivariate Normal density function.
+
+$$
+p_{\mu | \tau, \Sigma_0}(\mu) = \frac{1}{\sqrt{2 \pi |\Sigma_0|}} e^{-\frac{(\mu - \tau)^T \Sigma_0^{-1} (\mu - \tau) }{2}}
+$$
+
+### Posterior update
+
+$$
+\begin{aligned}
+p_{\mu | \mathbf{X}_1, \dots, \mathbf{X}_n, \Sigma}(\mu) &\propto p_{\mathbf{X}_1, \dots, \mathbf{X}_n | \mu, \Sigma}(\mathbf{x}_1, \dots, \mathbf{x}_n) \cdot p_{\mu | \tau, \Sigma_0}(\mu) \\
+&\propto e^{-\frac{\sum_{i=1}^n (\mathbf{x}_i - \mu)^T \Sigma^{-1} (\mathbf{x}_i - \mu) }{2}} e^{-\frac{(\mu - \tau)^T \Sigma_0^{-1} (\mu - \tau) }{2}} \\
+&= e^{-\frac{\sum_{i=1}^n \mathbf{x}_i^T \Sigma^{-1} \mathbf{x}_i - 2 \mu^T \Sigma^{-1} \sum_{i=1}^n \mathbf{x}_i + n \mu^T  \Sigma^{-1} \mu}{2}} e^{-\frac{\mu^T  \Sigma_0^{-1} \mu - 2 \mu^T  \Sigma_0^{-1} \tau + \tau^T  \Sigma_0^{-1} \tau}{2}} \\
+&\propto e^{-\frac{\mu^T \big(n\Sigma^{-1} + \Sigma_0^{-1}\big) \mu - 2 \mu^T \big(\Sigma^{-1} \sum_{i=1}^n \mathbf{x}_i + \Sigma_0^{-1}\tau\big)}{2}} \\
+&\propto \text{MultiNormal}\bigg(\big(n\Sigma^{-1} + \Sigma_0^{-1}\big)^{-1} \big(n \Sigma^{-1} \bar{\mathbf{x}} + \Sigma_0^{-1}\tau\big), \big(n\Sigma^{-1} + \Sigma_0^{-1}\big)^{-1} \bigg)
+\end{aligned}
+$$
+
+## Inference on covariance matrix $\Sigma$ with known mean $\mu$
+
+```{r, fig.height=3}
+D2Norm <- function(x, mu, Sigma){
+  n <- length(mu)
+  res <- rep(0, nrow(x))
+  for(i in 1:nrow(x)){
+    res[i] <- (1 / (2*pi*det(Sigma)))*exp((-1/2)*t(x[i, ] - mu)%*%MASS::ginv(Sigma)%*%(x[i, ] - mu))
+  }
+  return(res)
+}
+mu <- matrix(rep(0, 6), nrow = 2)
+Sigma <- list(matrix(c(2, 1.4, 1.4, 2), nrow = 2),
+              matrix(c(1.7, -0.9, -0.9, 1.7), nrow = 2),
+              matrix(c(3, -0.05, -0.05, 3), nrow = 2))
+par(mfrow = c(1, 3))
+for(i in 1:3){
+  x <- seq(-5, 5, length.out = round(sqrt(500)))
+  ex <- expand.grid(x, x) %>% dplyr::arrange(Var1, Var2)
+  contour(x = x, y = x, t(matrix(D2Norm(as.matrix(ex), mu[,i], Sigma[[i]]), nrow = round(sqrt(500)))),
+          xlab = expression(X[1]), ylab = expression(X[2]))
+  eig_sig <- eigen(Sigma[[i]])
+  arrows(x0 = mu[1,i], y0 = mu[2,i], 
+         x1 = mu[1,i] + sqrt(eig_sig$values[1])*eig_sig$vectors[1,1],
+         y1 = mu[2,i] + sqrt(eig_sig$values[1])*eig_sig$vectors[2,1],
+         length = 0.1, lwd = 2.5, col = "#a50f15")
+  arrows(x0 = mu[1,i], y0 = mu[2,i], 
+         x1 = mu[1,i] + sqrt(eig_sig$values[2])*eig_sig$vectors[1,2],
+         y1 = mu[2,i] + sqrt(eig_sig$values[2])*eig_sig$vectors[2,2],
+         length = 0.1, lwd = 2.5, col = "#a50f15")
+  points(mu[1,i], mu[2,i], col = "black", cex = 2.5, pch = 16)
+}
+```
+
+### Conjugate prior
+
+As a function of $\Sigma^{-1}$ alone, the Multivariate Normal likelihood function is proportional to a Wishart density function.
+
+$$
+p_{\Sigma^{-1} | \Sigma_0^{-1}, \nu_0}(\Sigma^{-1}) = \frac{1}{2^{\nu_0p/2}|\Sigma_0|^{\nu_0/2} \Gamma_{p}(\nu_0/2)} |\Sigma^{-1}|^{\frac{\nu_0 - p - 1}{2}} e^{\text{tr}\big(\Sigma_0^{-1} \Sigma^{-1}\big)/2}
+$$
+
+### Posterior update
+
+$$
+\begin{aligned}
+p_{\Sigma^{-1} | \mathbf{X}_1, \dots, \mathbf{X}_n, \mu}(\Sigma^{-1}) &\propto p_{\mathbf{X}_1, \dots, \mathbf{X}_n | \mu, \Sigma}(\mathbf{x}_1, \dots, \mathbf{x}_n) \cdot p_{\Sigma^{-1} | \Sigma_0^{-1}, n}(\Sigma^{-1}) \\
+&\propto |\Sigma|^{-n/2} e^{-\frac{\sum_{i=1}^n (\mathbf{x}_i - \mu)^T \Sigma^{-1} (\mathbf{x}_i - \mu) }{2}} |\Sigma|^{-\frac{\nu_0 - p - 1}{2}} e^{\text{tr}\big(\Sigma_0^{-1} \Sigma^{-1}\big)/2} \\
+&= |\Sigma^{-1}|^{\frac{n + \nu_0 - p - 1}{2}} e^{-\frac{\text{tr}\big([\sum_{i=1}^n (\mathbf{x}_i - \mu)(\mathbf{x}_i - \mu)^T] \Sigma^{-1}\big) + \text{tr}\big(\Sigma_0^{-1} \Sigma^{-1}\big)}{2}} \\
+&= |\Sigma^{-1}|^{\frac{n + \nu_0 - p - 1}{2}} e^{-\frac{\text{tr}\big(([\sum_{i=1}^n (\mathbf{x}_i - \mu)(\mathbf{x}_i - \mu)^T]  + \Sigma_0^{-1}) \Sigma^{-1}\big)}{2}} \\
+&\propto \text{Wishart}\bigg(\big([\sum_{i=1}^n (\mathbf{x}_i - \mu)(\mathbf{x}_i - \mu)^T]  + \Sigma_0^{-1}\big)^{-1}, n + \nu_0 \bigg)
+\end{aligned}
+$$
+
+
+
+

@@ -1,0 +1,464 @@
+---
+title: "Untitled"
+author: "Duke Department of Statistical Science"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+library(ggplot2)
+library(mlmRev)
+library(tidybayes)
+library(ggstance)
+library(modelr)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+We have data from a General Certificate of Secondary (GCSE) exam, which is an academic qualification taken un the UK. There are two components to the exam: a written paper and course work. Both are included in the dataset, along with the school each student attended, the student's unique ID, and the gender of the student. We will work only with the course work variable as our response variable:
+
+```{r}
+data(Gcsemv, package = "mlmRev")
+summary(Gcsemv)
+
+# Make Male the reference category and rename variable
+Gcsemv$female <- relevel(Gcsemv$gender, "M")
+# Use only total score on coursework paper
+GCSE <- subset(x = Gcsemv,
+               select = c(school, student, female, course))
+set.seed(40)
+samps <- sample(1:nrow(GCSE), 20, replace = F)
+(GCSE_test <- GCSE[samps,])
+GCSE <- GCSE[-samps,]
+
+# Count unique schools and students
+m <- length(unique(GCSE$school))
+N <- nrow(GCSE)
+```
+
+Each individual $i$ belongs to a certain school $j$ ($i = 1,\ldots, n$ and $j = 1,\ldots, m$), where $m =$ `r m`. We also have the gender variable which we can use as regressors/predictors of the response. A natural first step may be to model course work with a linear regression model with the gender variable as a covariate. For each school, calculate the sample average of the `course` scores and plot them in a histogram. What does this plot reveal?
+
+```{r, eval = F}
+GCSE %>% group_by(school) %>% na.omit()%>%
+  summarise(avg_course = mean(course)) %>%
+  ggplot(aes(x = avg_course))+
+  geom_histogram()
+```
+
+Suppose we did not want to take the different schools into account, and simply fit the linear model $$y_i \sim N(\alpha + x_i' \beta, \sigma)$$ We call this model a "pooled" model because we are ignoring differences between the groups and use the common $\beta_1$ coefficient. The pooled model estimates single model, with inference performs on three parameters $\alpha, \beta,$ and $\sigma$.
+
+The other extreme is the "unpooled" model where we fit a separate model for each group/school. So for individual $i$ in school $j$, we fit the model $$y_{i,j} \sim N(\alpha_{j} + s_i' \beta_j, \sigma_j)$$ In the unpooled framework, we estimate $m$ models, but \textit{no} information is shared between groups. That is, we estimate the coefficients for the first school independently of the coefficients for the second school. Both are fit here:
+
+```{r}
+pooled <- stan_glm(course ~ 1 + female, data = GCSE, refresh = 0)
+unpooled <- stan_glm(course ~ -1 + school + female,data=GCSE, refresh = 0)
+```
+
+However, it seems likely that we can improve our models if we can share information about the $\alpha$ and $\beta$ between groups. This naturally leads to a hierarchical framework where we use a prior distribution to encode relationships across the schools. This is called partial-pooling, or multilevel/hierarchical modeling.
+
+## Model 1: Varying intercept model with no predictors (Variance components model)
+If we let $Y_{ij}$ be individual $i$ in school $j$'s exam score, we can write the following model: $$
+\begin{align*}
+&Y_{ij} = \theta_j + \epsilon_{ij}, \quad \epsilon_{ij} \ iid \sim N(0, \sigma^2) \\
+&\theta_j = \mu_\theta + \omega_j, \quad \omega_j \ iid \sim N(0, \tau^2)
+\end{align*}$$
+
+We see that $\theta_j$ is the school-specific intercept, and $\mu_\theta$ is the overall mean across the $m$ schools. We could introduce the covariates into this model as well, but we begin with a simple intercept-only regression:
+
+```{r mod1}
+mod1 <- stan_lmer(formula = course ~ 1 + (1 | school),
+                  data = GCSE,
+                  seed = 349,
+                  refresh = 0)
+```
+
+As the code runs, let us discuss the function call. The `stan_lmer()` function allows for easy multilevel/hierarchical modeling. Looking to the formula, we have $$\text{formula} = \text{course}\sim 1 + (1 \ | \text{ school})$$
+
+Like usual lm(), the variable on the left of the tilde is our response variable. The 1 on the right specificies that we would like an intercept, and the $(1 \ | \text{ school})$ term specifies that we would like the intercept to vary by the variable ``school''. We will estimate an overall intercept, and then for each school we will estimate a term that provides an adjustment or deviation from that intercept. We can think of the multilevel modeling as introducing a random effect or error, because we are allowing the intercept to be a random process. 
+
+In the function call, we did not set a prior which means that we used the default priors for $\mu_\theta$, $\sigma^2$, and $\tau^2$. We can see the priors that were used by running the following code:
+
+```{r check_priors}
+prior_summary(object = mod1)
+```
+
+Question: What are the default priors used for $\mu_\theta$ and $\sigma$ (not $\sigma^2$)?
+
+Notice that the priors have been scaled (we could set autoscale = F in the function call to avoid this). Where did the adjusted scale values come from? Consider the observed standard deviation of the course variable:
+
+```{r}
+sd(GCSE$course, na.rm = T)
+```
+
+Question: What are the rescaled priors for $\mu_\theta$ and $\sigma$?
+
+Looking towards the output of from the model fitting, we can obstain posterior summaries and credible intervals as follows: 
+
+```{r}
+print(mod1, digits = 3)
+summary(mod1,
+        pars = c("(Intercept)", "sigma", "Sigma[school:(Intercept),(Intercept)]"),
+        probs = c(0.025, 0.975),
+        digits = 3)
+```
+
+Question: Report on the posterior estimates of $\mu_\theta$, $\sigma$, and $\tau^2$.
+
+If we want to create plots, it is helpful to extract the posterior draws. We can extract the draws for each variable by specifying the variable name, as we've seen before. Notice that we use regex_pars, which means that we want to extract all the variables with names that match the form the regular expression.
+
+```{r}
+mod1_sims <- as.matrix(mod1)
+dim(mod1_sims)
+par_names <- colnames(mod1_sims)
+head(par_names)
+tail(par_names)
+
+# obtain draws for mu_theta
+mu_theta_sims <- as.matrix(mod1, pars = "(Intercept)")
+
+# obtain draws for each school's contribution to intercept
+theta_sims <- as.matrix(mod1,
+                        regex_pars ="b\\[\\(Intercept\\) school\\:")
+
+
+# to finish: obtain draws for sigma and tau^2
+sig_sims <- as.matrix(mod1,
+                      pars = "sigma")
+tau2_sims <- as.matrix(mod1,
+                       pars = "Sigma[school:(Intercept),(Intercept)]")
+```
+
+The Intercept variable is the same for all of the `r J` schools (corresponds to the 1 in the regression formula). The ''(1 \ | \text{ school})'' term in the formula is each school's specific difference from the overall intercept. These differences have coefficients named ``b[(Intercept) school: <school number>]''. With this information, finish the following line of code to compute the 73 total varying intercepts. Then compute and store the the posterior means and 95\% credible intervals for each intercept:
+
+```{r}
+int_sims <- as.numeric(mu_theta_sims) + theta_sims
+
+# posterior mean
+int_mean <- apply(int_sims, MARGIN = 2, FUN = mean)
+
+# credible interval
+int_ci <- apply(int_sims, MARGIN = 2, FUN = quantile, probs = c(0.025, 0.975))
+int_ci <- data.frame(t(int_ci))
+
+# combine into a single df
+int_df <- data.frame(int_mean, int_ci)
+names(int_df) <- c("post_mean","Q2.5", "Q97.5")
+
+# sort DF according to posterior mean
+int_df <- int_df[order(int_df$post_mean),]
+
+# create variable "index" to represent order
+int_df <- int_df %>% mutate(index = row_number())
+
+# plot posterior means of school-varying intercepts, along with 95 CIs
+ggplot(data = int_df, aes(x = index, y = post_mean))+
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5))+
+  scale_x_continuous("Index", breaks = seq(0,J, 5)) +
+  scale_y_continuous(expression(paste("varying intercept ", theta[j])))
+
+```
+
+### Comparisons between schools
+Now that we have sampled all the parameters and obtained the varying intercepts posterior estimates, we may be interested in comparing the intercepts of schools. Choose two schools and report on their difference in average scores with descriptive statistics, a histogram, and interpretation. 
+
+# Model 2: Varying intercept with a single indvidual-level predictor
+We can add a level of complexity to the model by taking advantage of the covariates provided to us. Let $x_{ij}$ be the value of the covariate for individual $i$ in school $j$. Then the only modification to Model 1 is a change to the observation equation:
+$$Y_{ij} \sim N(\theta_j + \beta X_{ij}, \sigma^2)$$.
+
+If we allow $X_{ij}$ to represent whether or not individual $i$'s is female, how would we code this? (The coefficient for the female covariate $\beta$ will be the same for all schools). Also notice in the code that we specify a prior for $\mu_\theta$ hyperparameter and for the $\beta$ ceofficient, and that we chose to not autoscale the data.
+
+Question: How informative is our prior for $\beta$? What will be the prior for $\sigma$?
+
+```{r mod2}
+mod2 <- stan_lmer(formula = course ~ 1+ female + (1 | school),
+                  data = GCSE, 
+                  prior = normal(location = 0,
+                                        scale = 100,
+                                        autoscale = FALSE),
+                  prior_intercept = normal(location = 0,
+                                        scale = 100,
+                                        autoscale = F),
+                  seed = 349,
+                  refresh = 0)
+
+# plot varying intercepts
+mod2.sims <- as.matrix(mod2)
+group_int <- mean(mod2.sims[,1])
+mp = mean(mod2.sims[,2])
+bp = apply(mod2.sims[, 3:75], 2, mean)
+xvals = seq(0,1,.01)
+plot(x = xvals, y = rep(0, length(xvals)), 
+     ylim = c(50, 90), xlim = c(-0.1,1.1), xaxt = "n", xlab = "female", ylab = "course")
+axis(side = 1, at = c(0,1))
+for (bi in bp){
+  lines(xvals, (group_int + bi)+xvals*mp)
+}
+```
+
+Question: What are the posterior means and credible intervals of $\mu_\theta,\beta, \sigma$, and $\tau^2$?
+
+# Model 3: Varying intercept and varying slope model with single predictor
+Now, we allow the coefficient for female to vary across the `r J` schools: $$Y_{ij} \sim N(\theta_j + \beta_j X_{ij}, \sigma^2)$$
+
+When we do not allow group-specific intercept and slopes, it is common to model the coefficients independently. However, if we allow the intercept and slope and vary randomly across the schools, we should model them as dependent processes: $$
+\begin{bmatrix}\theta_j \\ \beta_j \end{bmatrix} \sim N\left( 
+\begin{bmatrix} \mu_\theta \\ \mu_\beta \end{bmatrix}, 
+\begin{bmatrix}
+\sigma^2_\theta & Cov(\theta_j, \beta_j)\\
+Cov(\beta_j, \theta_j) & \sigma^2_\beta
+\end{bmatrix}\right)$$
+
+We will now have to specify a prior for the covariance matrix, which we will call $\Sigma$. 
+Setting priors for covariance parameters is always a tricky task, and we here we will explain the default priors used in `stan_lmer()`. The  function decomposes a covariance matrix into a correlation matrix $R$ and a matrix of variances $V$:
+$$\begin{align*}
+\Sigma &= \begin{bmatrix}
+\sigma^2_\theta & Cov(\theta_j, \beta_j)\\
+Cov(\beta_j, \theta_j) & \sigma^2_\beta
+\end{bmatrix} \\
+&= \begin{bmatrix}
+\sigma^2_\theta & \rho \sigma_\theta \sigma_\beta \\
+\rho \sigma_\theta \sigma_\beta & \sigma^2_\beta
+\end{bmatrix} \\
+&= \sigma^2 \begin{bmatrix}
+\sigma^2_\theta/\sigma^2 &  \rho \sigma_\theta \sigma_\beta/\sigma^2 \\
+ \rho \sigma_\theta \sigma_\beta/\sigma^2 & \sigma^2_\beta/\sigma^2
+\end{bmatrix} \\
+&= \sigma^2 \begin{bmatrix}
+\sigma_\theta/\sigma &  0 \\
+0 & \sigma_\beta/\sigma
+\end{bmatrix} \begin{bmatrix} 1 & \rho \\ \rho & 1 
+\end{bmatrix}\begin{bmatrix}
+\sigma_\theta/\sigma &  0 \\
+0 & \sigma_\beta/\sigma
+\end{bmatrix}\\
+&= \sigma^2 VRV
+\end{align*}$$
+
+After decomposing the covariance matrix into correlation and variance matrices, the variances are further decomposed into the product of a simplex vector and the trace of the matrix. An LKJ prior is placed on the correlation matrix, with default being jointly uniform over all correlation matrices of the same dimensions as $R$. A symmetric Dirichlet prior is used on the simplex vector, with default being uniform over space of simplex vectors of the same size. See the priors help page for rstanarm for more information. 
+
+Now, to actually fit the model, finish the code to specify that we want both the intercept and the slope of the female covariate to vary across schools. The code will take much longer to run because of the extra sampling that goes into the random slopes:
+
+```{r mod3}
+mod3 <- stan_lmer(formula = course~ 1+ female + (1 + female | school),
+                  data = GCSE,
+                  seed = 349,
+                  refresh = 0)
+```
+
+```{r}
+mod3_sims <- as.matrix(mod3)
+
+# obtain draws for mu_theta
+mu_theta_sims <- as.matrix(mod3, pars = "(Intercept)")
+
+fem_sims <- as.matrix(mod3, pars = "femaleF")
+# obtain draws for each school's contribution to intercept
+theta_sims <- as.matrix(mod3,
+                        regex_pars ="b\\[\\(Intercept\\) school\\:")
+beta_sims <- as.matrix(mod3,
+                        regex_pars ="b\\[femaleF school\\:")
+
+int_sims <- as.numeric(mu_theta_sims) + theta_sims
+slope_sims <- as.numeric(fem_sims) + beta_sims
+
+# posterior mean
+slope_mean <- apply(slope_sims, MARGIN = 2, FUN = mean)
+
+# credible interval
+slope_ci <- apply(slope_sims, MARGIN = 2, FUN = quantile, probs = c(0.025, 0.975))
+slope_ci <- data.frame(t(slope_ci))
+
+# combine into a single df
+slope_df <- data.frame(slope_mean, slope_ci, levels(GCSE$school))
+names(slope_df) <- c("post_mean","Q2.5", "Q97.5", "school")
+
+# sort DF according to posterior mean
+slope_df <- slope_df[order(slope_df$post_mean),]
+
+# create variable "index" to represent order
+slope_df <- slope_df %>% mutate(index = row_number())
+
+# plot posterior means of school-varying intercepts, along with 95% CIs
+ggplot(data = slope_df, aes(x = index, y = post_mean))+
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5))+
+  scale_x_continuous("Index", breaks = seq(1,J, 1),
+                     labels = slope_df$school) +
+  scale_y_continuous(expression(paste("varying slopes ", beta[j])))+
+  theme(axis.text.x = element_text(angle = 90))
+
+
+# plot varying slopes and intercepts by school
+schools <- unique(GCSE$school)
+plot(x + rnorm(length(x)) *0.001, y, 
+       ylim = c(45, 100), xlab = "female",main = sample_schools[i], xaxt = "n", ylab = "course", cex = 0)
+axis(1,c(0,1),cex.axis=0.8)
+
+for ( i in 1:length(schools)){
+  xvals = seq(-0.1, 1.1, 0.01)
+  temp = GCSE %>% filter(school == schools[i]) %>%
+    na.omit()
+  y <- temp$course
+  x <- as.numeric(temp$female)-1
+  slope <- partial.fem3 + mean(m3[, 2 + i*2])
+  intercept <- alpha3 + mean(m3[, 1 + i*2])
+  if (slope >= 0){
+      lines(xvals, xvals*(slope) + (intercept), col = "orange")
+  }
+  else{
+      lines(xvals, xvals*(partial.fem3 + mean(m3[, 2 + i*2])) + (alpha3 + mean(m3[, 1 + i*2])), col = "blue")
+  }
+}
+```
+
+# Model Comparison
+
+Now that we've fit three different hierarhical models, we will compare them. We can use the `compare_models()` as we did in the GLM lab. However, since we are comparing more than 2 models, instead of a difference in expected log predictive density, the functions returns a matrix arranged in descending order according to expected out-of-sample predictive accuracy.
+
+```{r}
+compare_models(loo(pooled), loo(unpooled), loo(mod1), loo(mod2), loo(mod3))
+```
+
+Here, we plot the regression lines for some of the schools using the following models:
+  \begin{enumerate}
+  \item Pooled (red)
+  \item Unpooled (blue)
+  \item Varying intercept, fixed slope (green)
+  \item Varying intercept, varying slope (orange)
+  \end{enumerate}
+
+```{r, echo = F}
+pooled.sim <- as.matrix(pooled)
+unpooled.sim <- as.matrix(unpooled)
+m1.sim <- as.matrix(mod1)
+m2.sim <- as.matrix(mod2)
+m3.sim <- as.matrix(mod3)
+
+
+alpha2 = mean(m2.sim[,1])
+alpha3 <- mean(m3.sim[,1])
+
+partial.fem2 <- mean(m2.sim[,2])
+partial.fem3 <- mean(m3.sim[,2])
+unpooled.fem <- mean(unpooled.sim[,74])
+
+par(mfrow = c(2, 3), mar = c(1,2,2,1))
+for (i in 1:18){
+  temp = GCSE %>% filter(school == schools[i]) %>%
+    na.omit()
+  y <- temp$course
+  x <- as.numeric(temp$female)-1
+  plot(x + rnorm(length(x)) *0.001, y, ylim = c(35,101), xlab = "female",main =schools[i], xaxt = "n", ylab = "course")
+  axis(1,c(0,1),cex.axis=0.8)
+  
+  # no pooling
+  b = mean(unpooled.sim[,i])
+
+  # plot lines and data
+  xvals = seq(-0.1, 1.1, 0.01)
+  lines(xvals, xvals * mean(pooled.sim[,2]) + mean(pooled.sim[,1]), col = "red") # pooled
+  lines(xvals, xvals * unpooled.fem + b, col = "blue") # unpooled
+  lines(xvals, xvals*partial.fem2 + (alpha2 + mean(m2.sim[,i+2])) , col = "green") # varying int
+  lines(xvals, xvals*(partial.fem3 + mean(m3.sim[, 2 + i*2])) + (alpha3 + mean(m3.sim[, 1 + i*2])), col = "orange") # varying int and slope
+  legend("bottom", legend = paste("n =", length(y), " "))
+}
+```
+
+Compare and contrast the regression lines estimated using these different methods.
+
+# You try!
+
+We have data on the radon levels in houses in the state of Minnesota. Specifically, for each house we have the radon measurement on the log scale (log_radon), an indicator from whether the measurement was take in the basement or the first floor (floor), and which of 85 counties the house belongs to. We have an additional fourth variable which gives the county-level uraniam level (log_uranium).
+
+Do you think a hierarchical model is warranted here? Do some EDA!
+
+```{r}
+ggplot(radon, aes(x=log_radon))+
+  geom_histogram()
+radon%>% group_by(county)%>%
+  summarise(avg_radon = mean(log_radon)) %>%
+  arrange(desc(avg_radon)) %>%
+  filter(row_number()==1 | row_number()==n())
+```
+
+Begin by creating an unpooled model, i.e. a model where each county has a unique intercept. Call that model radon.unpooled. Then create a hierarchical/partially-pooled model where we model each county's intercept hierarchically. Call that model radon.mod1.
+
+```{r}
+#?radon
+radon.unpooled <- stan_glm(data=radon,
+                           formula = log_radon ~ county -1,
+                           refresh = 0)
+radon.mod1 <- stan_glmer(data = radon,
+                         formula = log_radon ~ 1 + (1|county), 
+                         refresh = 0)
+```
+
+Once you have fit the two models, run the following code. You should see two plots which give slightly wider than 95\% credible intervals for the county-level intercepts. What do you notice?
+
+```{r}
+n_county <- as.numeric(table(radon$county))
+create_df <- function(sim,model){
+  mean <- apply(sim,2,mean)
+  sd <- apply(sim,2,sd)
+  df <- cbind(n_county, mean, sd) %>%
+    as.data.frame()%>%
+    mutate(se = sd/ sqrt(n_county), model = model)
+  return(df)
+}
+
+unpooled.sim <-as.matrix(radon.unpooled)
+unpooled.df <- create_df(unpooled.sim[,1:85], model = "unpooled")
+
+
+mod1.sim <- as.matrix(radon.mod1)[,1:86]
+mod1.sim <- (mod1.sim[,1] + mod1.sim)[,-1]
+partial.df <- create_df(mod1.sim, model = "partial")
+
+ggplot(rbind(unpooled.df, partial.df)%>% mutate(model = factor(model, levels = c("unpooled", "partial"))), aes(x= n_county, y = mean)) +
+   #draws the means
+      geom_jitter() +
+   #draws the CI error bars
+      geom_errorbar(aes(ymin=mean-2*se, ymax= mean+2*se), width=.1)+
+  ylim(0,3)+
+  xlim(0,60)+
+  geom_hline(aes(yintercept= mean(coef(radon.unpooled))))+
+  facet_wrap(~model)
+
+```
+
+Next, continue to fit a varying-intercept model, but now add the variable floor as a fixed slope for radon.mod2.
+
+For radon.mod3, fit a varying-intercept and varying-slope model.
+
+Lastly, recall that we have a fourth variable which gives the county-level log uranium measurements. A really powerful aspect of hierarchical/multilevel modeling is the ability to incorporate data at different levels of coarseness. Now fit a varying-intercept model, but include both floor and log_uranium in your model as well. So now we have both an individual/house-level covariate, as well as a group/county-level covariate. Group-level predictors help reduce group-level variation, which induces stronger pooling effects. Call this model radon.mod4.
+
+```{r}
+radon.mod2 <- stan_glmer(data = radon,
+                         formula = log_radon ~ 1 + floor + (1 | county),
+                         refresh = 0)
+
+radon.mod3 <-  stan_glmer(data = radon,
+                         formula = log_radon ~ 1 + floor + (1 +floor| county),
+                         refresh = 0)
+
+radon.mod4 <- stan_glmer(data = radon,
+                         formula = log_radon ~ 1 + floor + log_uranium + 
+                           (1 + floor + log_uranium| county),
+                         refresh = 0)
+
+loo.unpooled <- loo(radon.unpooled)
+loo1 <- loo(radon.mod1)
+loo2 <- loo(radon.mod2)
+loo3 <- loo(radon.mod3)
+loo4 <- loo(radon.mod4)
+compare_models(loo.unpooled, loo1, loo2, loo3, loo4)
+```
+https://mc-stan.org/users/documentation/case-studies/radon.html
+
+https://mjskay.github.io/tidybayes/articles/tidy-rstanarm.html#plotting-points-and-intervals

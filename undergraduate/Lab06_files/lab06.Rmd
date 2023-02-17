@@ -1,0 +1,257 @@
+---
+title: "Lab 6: Bayesian (Generalized) Linear Regression Models"
+author: "Duke Department of Statistical Science"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+library(tidyverse)
+library(ggplot2)
+library(loo)
+library(bayesplot)
+library(caret)
+library(rstan)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+# Linear Regression
+
+An experiment was run where clouds were seeded with silver iodide to examine if increased rainfull occurred. These, the treatment variable is whether or not the cloud was seeded, and the response is the amount of rainfall. We have other covariates including: the suitability criterion (sne), the percentage cloud cover in the experimental area, the prewetness/total rainfall in target area one hour before seeding, the echomotion (stationary or moving), and the number of days after the first day of the experiment (time). 
+```{r}
+data("clouds", package = "HSAUR3")
+head(clouds)
+```
+
+## Frequentist Approach
+
+We will use a linear regression model to predict rainfall--we will include interactions of all covariates with seeding with the exception of the time variable. In the usual frequentist setting, we can fit the model as follows:
+```{r}
+ols <- lm(rainfall ~ seeding * (sne + cloudcover + prewetness + echomotion) + time,
+          data = clouds)
+coef(ols)
+```
+
+## Bayesian Approach
+
+To run this model using Bayesian estimation, the `rstanarm` package wraps Stan code for common regression models. However as we know, with Bayesian estimation we need to specify priors for our parameters. `rstanarm` is convenient in its familiar interface, but it sometimes requires employing priors that we are unfamiliar with. The `rstanarm` function equivalent of lm() is stan_lm(), and it requires a prior that is easy to specify but more difficult to conceptualize. 
+
+\textbf{for graduate students}
+By now, we have learend that the OLS predictor for $\beta$ is $\hat{\boldsymbol{\beta}} = (\boldsymbol{X}'\boldsymbol{X})^{-1}\boldsymbol{X}'\boldsymbol{Y}$ where $\boldsymbol{X}$ is the design matrix of centered predictors. As it turns out, the `lm` function in R performs QR decomposition on $\boldsymbol{X}$: $\boldsymbol{X} = \boldsymbol{Q}\boldsymbol{R}$ where $\boldsymbol{Q}$ is an orthogonal matrix ($\boldsymbol{Q}'\boldsymbol{Q} = \boldsymbol{I}$) and $\boldsymbol{R}$ is upper-triangular. So we can re-write the OLS estimators as (verify this!): $$\hat{\boldsymbol{\beta}}= (\boldsymbol{X}'\boldsymbol{X})^{-1}\boldsymbol{X}'\boldsymbol{Y} = \boldsymbol{R}^{-1} \boldsymbol{Q}' \boldsymbol{Y}$$ `lm()` uses the QR decomposition for numerical stability, but `stan_lm()` takes advantage of the QR decomposition for a way to think about priors. Glossing over details \textbf{because i don't understand them yet}, we can set a prior for $R^2$, the coefficient of determination for the linear model. 
+
+Come again? We set our prior based on how well we think our linear model will explain the variation in the response. Lewandowski, Kurowicka, and Joe (2009) derive a distribution for a correlation matrix that depends on a single shape parameters $\eta > 0$, and find that $R^2 \sim Beta(p/2, \eta)$ where $p$ is the number of covariates. In `stan_lm()`, we can specify $\eta$ to encode our prior information. The prior function is `R2(location, what)`, and we can encode prior beliefs in the following ways of specifying $\eta$:
+  1. `what = "mode"`, and location is some prior mode on the (0,1) interval (i.e. what you think $R^2$ might be). However, the mode only exists if $p >2$, so if we have only have one or two predictors we have to specify a prior using the remaining options.
+  2. `what = "mean"` and location is some prior mean on (0,1).
+  3. `what = "median"` and location is some prior median on (0,1).
+  
+### Prior Specification: $R^2$
+
+There is no default prior, and by specifying a prior on $R^2$ we make it an informative one, though it appears that setting `location = 0.5` is quite harmless regardless of `what`. Specifying `NULL` for the prior results in a Uniform(0,1) prior. Not knowing much about silver iodide's potential to explain variation in rainfall, I might be skeptical and set my prior belief of $R^2$ to be quite low. Notice that we did not look at the $R^2$ from the OLS model above.
+
+```{r, cache = T}
+r2.prior <-  rstanarm::R2(location = 0.2, what = "mode")
+
+stan.lm <- stan_lm(data = clouds,
+                   formula = rainfall ~ seeding * 
+                     (sne + cloudcover + prewetness + echomotion) + time,
+                   prior = r2.prior,
+                   refresh = 0)
+
+stan.lm$coefficients
+stan.lm$stan_summary
+```
+
+The default point estimates given for the Bayesian model are posterior medians, but if we want posterior means and credible intervals we can use access them via stan_summary. How do the estimates for the $\beta$ coefficients compare to the OLS estimates? If they same different, why might that be the case? Consider changing the location parameter in the prior and see how that effects inference. If you want to see what priors were used, we can we run the `prior_summary()` function:
+```{r}
+prior_summary(stan.lm)
+```
+
+The R output also estimates an auxiliary parameter `log-fit_ratio`, or $\log(\omega)$ where $\omega = s_y / \sigma_y$. `stan_lm()` utilizies an improper uniform perior on $\log(\omega)$. If $\log(\omega) = 0$, then that implies that $\sigma_y = s_y$ (the marginal standard deviation of the outcome rainfall implied by the model is the same as the sample standard deviation). If $\log(\omega) > 0$, then the marginal posterior variance of the outcome will exceed the sample variance of the outcome so the model overfits the data, or the relationship may not be nonlinear. If the model extremely over or underfits the data, we may want to reconsider the model for $y$.
+
+What is the posterior mean of `log-fit_ratio`? What is its interpretation? Do we need to consider a new model?
+
+```{r, cache = T}
+clouds_cf <- clouds
+clouds_cf$seeding[] <- "yes"
+y1_rep <- posterior_predict(stan.lm, newdata = clouds_cf)
+clouds_cf$seeding[] <- "no"
+y0_rep <- posterior_predict(stan.lm, newdata= clouds_cf)
+qplot(x = c(y1_rep - y0_rep), geom = "histogram", xlab = "Estimated ATE", ylab = "")
+```
+
+### Prior Specification: $\beta$ Coefficients
+
+The $R^2$ prior is convenient and simple to use, but I personally have trouble conceptualizing it. Luckily, we can utilize the `stan_glm()` function which allows us to fit a linear model so long as we specify the `family` paramter to be normal. We now have more flexibility in the priors we'd like to set for the intercept and remaining $\beta$ coefficients (in fact, we must specify priors for these coefficients). The following code places independent Cauchy priors on the intercept and remaining predictors via the `prior_intercept` and `prior` arguments.
+
+```{r, cache = T}
+beta0.prior <- cauchy()
+beta.prior <- cauchy()
+
+stan.glm <- stan_glm(data = clouds,
+                   formula = rainfall ~ seeding * (sne + cloudcover + prewetness + echomotion) + time,
+                   family = gaussian(),
+                   prior = beta.prior,
+                   prior_intercept = beta0.prior,
+                   refresh = 0,
+                   refresh = 0)
+```
+
+How do the estimated coefficients compare in this glm model to those from the model fit using stan_lm()? 
+
+Let's compare the two models with an approximate LOOCV.
+```{r, cache = T}
+print(loo.glm <- loo(stan.glm, save_psis = T))
+(loo.lm <- loo(stan.lm, save_psis = T))
+rstanarm::compare_models(loo.glm, loo.lm)
+```
+
+Which model appears to perform better, in terms of LOOCV error? 
+
+Notice that running `loo()` on the glm model threw some warnings. The warning is telling us that some of the estimated shape parameters for the generalized Pareto distribution are above 0.7 in the glm model. This indicates that some obvserations from the LOO posteriors are different enough from the full posterior pre-LOO that the importance-sampling is not able to correct the difference. Notice that three observations have bad estimated shape parameters, so the Monte Carlo SE of the expected log predictive density (`elpd_loo`) is NA. Therefore, we should not consider the LOOCV estimates to be reliable, so it doesn't really make sense to compare the two models. 
+
+We can further examine the problematic observations in LOOCV by running the following code. Points in the (0.5, 0.7] are problematic, and points above 0.7 are not good. 
+
+```{r}
+plot(loo.lm, label_points = T)
+plot(loo.glm, label_points = T)
+```
+
+The `p_loo` estimate provides the estimated effective number of parameters. The lm model has an estimated 6.3 effective parameters, which is much lower than that from the glm model. 
+
+With so few observations compared to the number of predictors, we should be cautious in how reliable the estimates are. Using independent, heavy-tailed Cauchy priors may be too weak to allow for stable computations.
+
+# Logistic Regression
+
+Now that we've used the `stan_glm()` function, you might be wondering if you can fit other GLMs with a Bayesian model. And yes we can! The `stan_glm()` function supports every link function that `glm()` supports. We will fit a logisitic regression model here. Suppose we are interested in how an undergradate student's GRE, GPA, and college prestigiousness affect their admission into graduate school. The response variable is thus whether or not the student was admitted.
+
+```{r}
+seed <- 196
+admissions <- read.csv("https://stats.idre.ucla.edu/stat/data/binary.csv")
+## view the first few rows of the data
+head(admissions)
+admissions$rank <- factor(admissions$rank)
+admissions$admit <- factor(admissions$admit)
+admissions$gre <- scale(admissions$gre)
+p <- 5
+n <- nrow(admissions)
+```
+
+## Frequentist Approach
+
+```{r}
+freq.mod <- glm(admit ~. , data = admissions,
+                family = binomial())
+summary(freq.mod)
+```
+
+## Weakly Informative Prior: Normal
+
+We have the choice of a logit or probit link. With `stan_glm()`, binomial models with a logit link function can typically be fit slightly faster than the identical model with a probit link because of how the two models are implemented in Stan. In the following code, we simply specify the chosen link, and set priors for the intercept and the predictor coefficients.
+
+What do our choice of priors say about our beliefs?
+
+```{r, cache = T}
+post1 <- stan_glm(admit ~ ., data = admissions,
+                 family = binomial(link = "logit"), 
+                 prior = normal(0,1), prior_intercept = normal(0,1),
+                 seed = seed,
+                 refresh = 0)
+```
+
+As always, it is good practice to run diagnostics to check model convergence. The \textit{really cool} function that follows will allow you to do this without having to call many different functions:
+
+```{r, eval = F}
+launch_shinystan(post1)
+```
+
+Now we can look at posterior densities and estimates for the coefficients. It is quite amazing.
+
+```{r, cache = T}
+mcmc_areas(as.matrix(post1), prob = 0.95, prob_outer = 1)
+round(coef(post1), 3)
+round(posterior_interval(post1, prob = 0.95), 3)
+```
+
+## Some PPC
+
+```{r, cache = T}
+(loo1 <- loo(post1, save_psis = TRUE))
+```
+
+Above, we examine the strength of our model via its posterior preditive LOOCV. However as we know, this accuracy rate is quite meaningless unless we have something to compare it to. So let's create a baseline model with no predictors to compare to this first model:
+
+```{r, cache = T}
+post0 <- stan_glm(admit ~ 1, data = admissions,
+                 family = binomial(link = "logit"), 
+                 prior = normal(0,1), prior_intercept = normal(0,1),
+                 seed = seed,
+                 refresh = 0)
+(loo0 <- loo(post0, save_psis = T))
+rstanarm::compare_models(loo0, loo1)
+```
+
+Which model is better?
+
+## More PPC
+
+Next, we compute posterior predictive probabilities of the linear predictor via the `poster_linpred()` function provided in the rstanarm package. This function will extract posterior draws from the linear predictor. If we used a link function, then specifying the transform argument as True will return the predictor as transformed via the inverse-link. (Note: this differs from the `posterior_predict()` function which draws from the posterior predictive distribution of the \textit{outcome}). 
+
+```{r, cache = T}
+preds <- posterior_linpred(post1, transform=TRUE)
+pred <- colMeans(preds)
+```
+
+We calculate these posterior predictive probabilities in order to determine the classification accuracy of our model. If the posterior probability of success for an individual is greater or equal to 0.5, then we would predict that observation to be a success (and similarly for less than 0.5). Then for each observation, we compare the posterior prediction to the actual observed. The proportion of times we correctly predict an individual (i.e. [prediction = 0 and observation = 0] or [prediction = 1 and observation = 1]) is our classification accuracy.
+
+```{r}
+pr <- as.integer(pred >= 0.5)
+# have the students calculate this themselves?
+round(mean(xor(pr,as.integer(admissions$admit==0))),3)
+
+#round((mean(xor(pr[admissions$admit==0]>0.5,as.integer(admissions$admit[admissions$admit==0])))+mean(xor(pr[admissions$admit==1]<0.5,as.integer(admissions$admit[admissions$admit==1]))))/2,2)
+```
+
+However, we should really be evaluating the classification accuracy of our model on unseen data. This can be done via a LOOCV approach or by using a test dataset. Here we use the former approach to illustrate the function `E_loo()`, which uses importance weights generated from the `loo()` function.
+
+```{r, cache = T}
+ploo=E_loo(preds, loo1$psis_object, type="mean", log_ratios = -log_lik(post1))$value
+round(mean(xor(ploo>0.5,as.integer(admissions$admit==0))),3)
+#round((mean(xor(ploo[admissions$admit==0]>0.5,as.integer(admissions$admit[admissions$admit==0])))+mean(xor(ploo[admissions$admit==1]<0.5,as.integer(admissions$admit[admissions$admit==1]))))/2,2)
+```
+
+## Another prior: Horseshoe Prior
+
+In the case when we have more variables than observations, it will be difficult to achieve good estimates of the coefficients. To address this hurdle, we may consider alternative priors on the $\beta$s which place prior mass on 0, effectively saying that those predictors should not be included in our final model. The horseshoe prior (`hs()`) is one such prior. In this dataset we have $n$ large and $p$ small, so the horseshoe is not necessary. However, we still examine its affect on posterior inference of the $\beta$ coefficients!
+
+```{r, cache = T}
+p0 <- 2 # prior guess for the number of relevant variables
+tau0 <- p0/(p-p0) * 1/sqrt(n) # recommended by Pilronen and Vehtari (2017)
+hs_prior <- hs(df=1, global_df=1, global_scale=tau0)
+post2 <- stan_glm(admit ~ ., data = admissions,
+                 family = binomial(link = "logit"), 
+                 prior = hs_prior, prior_intercept = normal(0,1),
+                 seed = seed,
+                 refresh = 0)
+
+round(coef(post2), 3)
+round(posterior_interval(post2, prob = 0.95), 3)
+mcmc_areas(as.matrix(post2), prob = 0.95, prob_outer = 1)
+```
+
+How does posterior inference for the coefficients compare to when we used the weakly informative Normal prior above? Make sure to comment specifically on the posterior distribution for the coefficient for `rank2`.
+
+How do the two models compare in terms of predictive performance?
+
+```{r}
+(loo2 <- loo(post2, save_psis = T))
+rstanarm::compare_models(loo1, loo2)
+```
+
+*Adapted from [tutorial](https://cran.r-project.org/web/packages/rstanarm/vignettes/lm.html)
+*Adapted from [tutorial](https://avehtari.github.io/modelselection/diabetes.html)

@@ -1,0 +1,25 @@
+---
+title: "Untitled"
+author: "Duke Department of Statistical Science"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+
+# Section 1
+
+# Section 2
+
+# Section 3
+
+# Section 4

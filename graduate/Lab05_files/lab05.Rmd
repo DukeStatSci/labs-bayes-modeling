@@ -1,0 +1,349 @@
+---
+title: "STA 601 Lab 4: Prior selection and model reparameterization"
+author: "STA 601: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(rstan)
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+# Prior selection
+
+Suppose we have data $Y$, which we take to be Normally distributed: $y_i \sim N(\mu, \sigma^2)$. Suppose further that we want to model $\mu$ as a linear function of a fixed covariate $x$ using an intercept $\alpha$ and coefficient $\beta$:
+
+$$
+\mu = \alpha + \beta x
+$$
+
+```{r functions, echo = F}
+create_df <- function(post_draws, prior_draws){
+  post_draws <- data.frame(post_draws)
+  post_draws$distribution <- "posterior"
+  
+  prior_draws <- data.frame(prior_draws)
+  colnames(prior_draws) <- "alpha"
+  prior_draws$distribution <- "prior"
+  dat <- rbind(post_draws, prior_draws)
+  return(dat)
+}
+```
+
+```{r data}
+set.seed(689934)
+
+alpha <- 1   
+beta <- -0.25 
+sigma <- 1    
+
+N <- 5
+x <- array(runif(N, 0, 2), dim=N)                    # cm
+y <- array(rnorm(N, beta * x + alpha, sigma), dim=N) # k$
+```
+
+Both $\alpha$ and $\beta$ are unknown, so we would like to perform inference on them. However, we only have `r N` data points. Given so few data points, we can be quite sure that the resulting posteriors will be sensitive to the choice of priors.
+
+## Flat priors
+
+One possible choice of prior is a flat prior for $\alpha$ and $\beta$. That is, $p(\alpha) \propto 1$ and $p(\beta) \propto 1$. Let's look at how our posterior beliefs about $\alpha$ and $\beta$ act under these priors.
+
+```{r flat}
+stan_dat <- list(y = y, x=x, N=N)
+fit.flat <- stan(file = "flat_prior.stan", data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=48)
+alpha.flat <- as.matrix(fit.flat, pars = "alpha")
+beta.flat <- as.matrix(fit.flat, pars = "beta")
+
+ggplot(alpha.flat %>% as.data.frame, aes(x = alpha)) +
+  geom_histogram(bins = 30)
+
+print(fit.flat, pars = c("alpha"))
+```
+
+Notice how the posterior for $\alpha$ is quite diffuse--there is much uncertainty about what $\alpha$ is. While the true value for $\alpha$ is `r alpha`, what is the posterior mean? What is the 95\% credible interval?
+
+***
+### Exercise
+
+Compute the posterior means of $\alpha$ and $\beta$. Give 95\% credible intervals for each. Considering the amount of data we have, do the results seem surprising? 
+
+***
+
+By doing inference with a flat/diffuse prior, we might have thought we were using the least prior information possible. However, flat priors may actually bias our estimates for a parameter by allowing the posterior to be pulled towards extreme and unlikely values, as evidenced above. 
+
+Diving a bit deeper, consider another flat prior: $\alpha \sim Unif(a, b)$. Under this prior, we are saying that we believe $a \leq \alpha \leq b$. We exhibit this in the following code, with the prior $\alpha \sim Unif(-10, 10)$
+
+```{r unif}
+stan_dat <- list(y = y, x=x, N=N, lb = -10, ub = 10)
+fit.unif <- stan(file = "unif_prior.stan", data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=48)
+alpha.unif <- as.matrix(fit.unif, pars = c("alpha"))
+beta.unif <- as.matrix(fit.unif, pars = c("beta"))
+
+ggplot(alpha.unif %>% as.data.frame, aes(x = alpha)) +
+  geom_histogram(bins = 30)
+
+print(fit.unif, pars = c("alpha"))
+```
+
+While the posterior mean under this Uniform prior is closer to the true value, the posterior is still very spread out. So we have seen that a diffuse or flat prior is \textit{not} necessarily non-informative, and in these cases is actually extremely informative! Diffuse priors inherently spread probability mass across large regions of parameter space. We often assume that the data will overwhelm the prior, so a diffuse prior will let the data dominate posterior inference. However as showcased here, having only a small amount of observed data may allow the diffuse prior to become informative. Therefore, it would be wise to make the conscious choice to have an informative prior. However, we might specify just how informative we would like our prior beliefs to be.
+
+## Weakly informative priors
+
+We often must consider the scale of the parameters we wish to estimate. In applied problems where we know how to interpret the parameters, the scale is easier to identify. We may consider a weakly informative prior to be such that if there is a reasonably large amount of data, the likelihood will dominate the posterior and the prior is not important. This sort of prior ought to rule out unreasonable parameter values, but is not so strong as to rule out possible values which might make sense. As a general rule, it is wise to not use hard constraints unless the bounds represent true constraints (ex. bounding a prior for a variance parameter below by 0). As an example, we might think that $\alpha$ could be between 0 and 1. Instead of setting the prrior $\alpha \sim Unif(0,1)$, it would be wise to use a Normal(0.5, 1) prior instead. In the following, we consider some weakly informative priors for the parameters. The data we have are on unit scale, so we consider priors also on the unit scale. 
+
+### Light-tailed
+
+In this section, we consider a $N(0,1)$ prior.
+
+```{r light-tail}
+stan_dat <- list(y = y, x=x, N=N)
+fit.norm <- stan(file = "normal_prior.stan", data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=49)
+
+alpha.norm<- as.matrix(fit.norm, pars = c("alpha"))
+
+ggplot(alpha.norm %>% as.data.frame, aes(x = alpha)) +
+  geom_histogram(bins = 30)
+
+print(fit.norm, pars = c("alpha"))
+```
+
+***
+### Exercise
+
+Compute the posterior means of $\alpha$ and $\beta$. Give 95\% credible intervals for each. How does the posterior inference under this $N(0,1)$ prior compare to the diffuse priors above? How informative is this weakly informative prior?
+
+***
+
+### Heavy-tailed
+
+Recall that the Cauchy has heavier/fatter tails than the Normal distribution. 
+
+```{r heavy_tail}
+stan_dat <- list(y = y, x=x, N=N)
+fit.cauchy <- stan(file = "cauchy_prior.stan",data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=55)
+
+alpha.cauchy<- as.matrix(fit.cauchy, pars = c("alpha"))
+
+ggplot(alpha.cauchy %>% as.data.frame, aes(x = alpha)) +
+  geom_histogram(bins = 30)
+
+print(fit.cauchy, pars = c("alpha"))
+```
+
+The following plot displays the posteriors for $\alpha$ under these two priors
+
+```{r}
+plot_dat <- create_df(alpha.norm, alpha.cauchy) %>% 
+  mutate(distribution = if_else(distribution == "posterior", "Normal","Cauchy"))
+
+ggplot(plot_dat, aes(alpha, fill = distribution)) + 
+  geom_histogram(binwidth = 0.25, alpha = 0.7, position = "identity")+
+  geom_vline(xintercept = alpha) +
+  scale_fill_brewer()
+```
+
+The Cauchy prior allocates higher probabiity mass to extreme values as compared to the Normal prior, while still concentrating most of the posterior mass for $\alpha$ within a desired scale.
+
+***
+### Exercise
+
+Would you say that a Cauchy prior is more or less informative than a Normal prior (assume that their inter-quartile ranges are comparable)?
+
+***
+
+# Sensitivity to prior selection
+
+In the previous example, the Normal and the Cauchy priors for $\alpha$ performed relatively similarly. The true value of $\alpha$ was 1 and the priors we used were weakly centered around 1, so we happened to choose a good scale for the parameter. Let's examine what happens when this is not the case. We will simulate new data now with $\alpha=10$ instead of 1. We will also double the number of data points to 10.
+
+```{r}
+alpha<-10
+N <- 10
+x <- runif(N, 0, 2)                    
+y <- rnorm(N, beta * x + alpha, sigma)
+```
+
+Considering first the same Normal prior as above: $\alpha \sim N(0,1)$.
+
+```{r light-tail2}
+stan_dat <- list(y = y, x=x, N=N)
+fit.norm <- stan(file = "normal_prior.stan", data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=49)
+
+alpha.norm<- as.matrix(fit.norm, pars = c("alpha"))
+prior_draws <- rnorm(1000, 0, 1)
+plot_dat <- create_df(alpha.norm, prior_draws)
+
+ggplot(plot_dat, aes(alpha, fill = distribution)) + 
+  geom_histogram(binwidth = 0.25, alpha = 0.7, position = "identity")+
+  geom_vline(xintercept = alpha) +
+  scale_fill_brewer()
+
+```
+
+Here the prior is once again weakly-informative, but notice how the prior is dominating the likelihood. The posterior is extremely sensitive to the choice of our prior, so much so that the we do not observe posterior values close to the true $\alpha$ at all. Instead, the posterior is concentrated around the upper extremes of the prior.
+
+What if we use a heavier-tailed distribution like the Cauchy?
+
+```{r heavy_tail2}
+stan_dat <- list(y = y, x=x, N=N)
+fit.cauchy <- stan(file = "cauchy_prior.stan",data = stan_dat, chains = 1, refresh = 0, iter = 1100, warmup = 100, seed=55)
+
+alpha.cauchy<- as.matrix(fit.cauchy, pars = c("alpha"))
+prior_draws <- rcauchy(1000, 0, 1)
+prior_draws <- prior_draws[abs(prior_draws) < 25]
+plot_dat <- create_df(alpha.cauchy, prior_draws)
+
+ggplot(plot_dat, aes(alpha, fill = distribution)) + 
+  geom_histogram(binwidth = .5, alpha = 0.7, position = "identity")+
+  geom_vline(xintercept = alpha) +
+  scale_fill_brewer()
+```
+
+Notice how under this Cauchy(0,1) prior, the posterior is able to concentrate around the true $\alpha = 10$. The heavy tails of the Cauchy allow the posterior to move beyond the scale occupied by the prior. From this histogram, it is much clearer that the prior we chose was probably inappropriate and conflicts with the data. 
+
+***
+### Exercise
+
+1. What happens as we increase the number of observations?
+2. When might we prefer to use lighter- versus heavier-tailed priors?
+3. How might we determine a reasonable scale for the prior?
+
+***
+
+*Adapted from [tutorial](https://mc-stan.org/users/documentation/case-studies/weakly_informative_shapes.html)
+
+# Model reparameterization
+
+Pierre-Simon, marquis de Laplace was interested in modeling the rate of female births in Paris in the 18th century: $\theta \in [0,1]$. Laplace had access to birth records in Paris between 1745 and 1770 with a total of $n$ entries, and so a reasonable model for $X$= number of female entries could be $X \sim Binomial(n,\theta)$, with $n$ known and $\theta \in [0,1]$. Laplace had no reason to believe that a certain value of $\theta$ was more likely than another, so he placed a Uniform(0,1) (or Beta(1,1)) prior on $\theta$. We may think this prior $\theta\sim Unif(0,1)$ to be uninformative--after all, it gives equal probability to every value in the range 0 and 1:
+
+```{r}
+theta <- runif(10000,0,1)
+hist(theta)
+```
+
+However, what if we consider the log-odds ratio of rate of female birth: $\eta = \log \dfrac{\theta}{1-\theta}$. By the same logic as above, Laplace should not have any reason to believe one value for the log-odds $\eta_1$ to be any more probable than another value $\eta_2$. Is this the case?
+
+```{r}
+logit <- function(x){
+  ret <- log(x/(1-x))# finish function for log odds
+  return(ret)
+}
+eta <- logit(theta)
+hist(eta)
+```
+
+Now we see that the distribution of the log-odds of $\theta$ is most certainly not uniform. We can map directly between values $\theta$ and $\eta$, but the prior distributions do not reflect the same type of uncertainty. 
+
+Let us pretend that the true birth rate of females in Paris was 0.3, and let us simulate some data with $N=10$ observations.
+
+```{r}
+set.seed(123);
+theta <- 0.3;
+N <- 10;
+(y <- rbinom(N, 1, theta))
+```
+
+We know that the MLE for $\theta$ is the proportion of successes:
+
+```{r}
+(theta.mle <- sum(y)/N)
+```
+
+## Success probability parameterization
+
+In this simple Beta-Binomial model, the parameter of interest is $\theta$ and we want to generate samples from the posterior $f(\theta | y)$. Take a look into the `prob.stan` file and see that we explicitly declare $\theta$ to be the parameter of interest with a Uniform(0,1) (or Beta(1,1)) prior. The following chunk of code runs performs posterior inference with this data model and prior.
+
+```{r}
+stan_dat <- list(y = y,N=N)
+fit.bayes.prob <- stan(file = "prob.stan", data = stan_dat, refresh = 0, iter = 1000)
+print(fit.bayes.prob, pars = c("theta", "eta"))
+```
+
+So we get a posterior mean $E[\theta|y]$ of 0.42 (verify this is what we would expect!).
+
+***
+### Exercise
+
+What would we expect to be the posterior mode of our samples? Calculate the posterior mode theoretically, and compare it to the output from Stan in the following code chunk.
+
+***
+
+```{r}
+model.prob <- stan_model("prob.stan");
+fit.pmode.prob <- optimizing(model.prob, data=c("N", "y"))
+fit.pmode.prob$par
+```
+
+## Log-odds parameterization
+
+What about a uniform prior belief on the log odds $\eta$? First, recognize that the support of $\eta$ is the entire real line, so a uniform prior belief on $\eta$ corresponds to an infinite-support flat prior (as detailed above). 
+
+If we transformed variables back to probabilities, we would see that the induced prior on $\theta$ would be a $\text{Beta}(0, 0)$.
+
+***
+### Exercise
+
+Is this prior proper? Does it result in a proper posterior? If so, under which conditions?
+
+***
+
+Let's try to sample from this model: 
+
+```{r}
+fit.logodds <- stan(file = "log_odds.stan", data = stan_dat, refresh = 0, iter = 1000)
+print(fit.logodds, pars = c("theta", "eta"))
+```
+
+## Odds parameterization
+
+Consider yet another parameterization of the binomial sampling model in terms of the (un-logged) odds $\pi = \frac{\theta}{1 - \theta}$.
+
+***
+### Exercise
+
+If we set a uniform prior for $\pi$, what is the induced prior on $\theta = \frac{\pi}{(1+\pi)}$? Is this prior proper?
+
+***
+
+From our work above, we realize that the innocuous uniform prior belief about $\theta$ sometimes translates into *improper* priors for transformations of $\theta$.
+
+## Jeffreys' prior
+
+Jeffreys (1961) suggested a default procedure for specifying a prior distribution for any parameter in the sampling model, which he designed to be invariant under transformations:
+
+$$
+p(\theta) \propto \sqrt{I(\theta)}
+$$
+
+where $I(\theta)$ is the Fisher Information *of the sampling model* $p(x | \theta)$:
+
+$$
+I(\theta) = - \text{E}\left[ \frac{\partial^2 \log \left( p(x | \theta) \right)}{\partial\theta^2} \right]
+$$
+
+and the expectation is taken with respect to the sampling distribution $p(x | \theta)$. It is important to recognize that because the Fisher Information is determined by the sampling model, the Jeffreys prior is also determined by the sampling model.
+
+***
+### Exercise
+
+Derive the Fisher Information of the Binomial sampling model under the success probability parameterization. From this expression, state the Jeffreys prior for $\theta$.
+
+***
+
+***
+### Exercise
+
+Write your own Stan file called `jeffreys.stan` to produce samples from the model under your derived Jeffreys prior. Use the existing `.stan` files as a guide. Use the code chunks above as a guideline to run Stan from R and print the results obtained from your sampler.
+
+***
+
+```{r}
+fit.jeffreys <- stan(file = "jeffreys.stan", data = stan_dat, refresh = 0, iter = 1000)
+print(fit.jeffreys, pars = c("theta", "eta"))
+```

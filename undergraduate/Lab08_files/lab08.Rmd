@@ -1,0 +1,239 @@
+---
+title: "STA 360 Lab 8: Truncated data and modeling"
+author: "STA 360: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+require(rstan)
+require(bayesplot)
+require(loo)
+require(readxl)
+require(plyr)
+require(ggrepel)
+library(cowplot)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+
+# Introduction
+
+By now you have worked extensively with exponential family distributions whose parameters have natural prior distributions called *conjugate priors*. This lab will take you through the process of building a generative model using a conjugate prior for a special member of the exponential family: the uniform density on an interval $[0, \theta]$. The model we will encounter restricts, or *truncates*, the support of some of the parameters. Using these **truncated distributions**, we will write and implement a Gibbs sampling algorithm to infer the value of the boundary parameter $\theta$ given noisy measurements from a uniform interval. 
+
+# Uniform likelihood
+
+Truncated distributions are usually described by a density function accompanied with an indicator function, which modifies the support of the random variable. For instance, a random variable $X$ with a uniform density function on an interval $[0, \theta]$ will have density function:
+
+$$
+p_{X | \theta}(x) = \frac{1}{\theta} \cdot \mathbb{I}[0 < x \leq \theta]
+$$
+
+Let's work through the conjuage update for the uniform likelihood to practice working with indicator functions.
+
+## Inference on boundary parameter $\theta$
+
+### Conjugate prior
+
+As a function of $\theta$ alone, the Uniform likelihood is proportional to a Pareto density function.
+
+$$
+p_{\theta | k, m}(\theta) = \frac{k m^k}{\theta^{k + 1}} \cdot \mathbb{I}[m \leq \theta]
+$$
+
+Because the Pareto prior is conjugate for the uniform likelihood, we know that the posterior distribution of $\theta$ will also be Pareto. But what is the form of this posterior distribution?
+
+### Posterior update
+
+Since we assume an independent sampling mechanism, we can combine the indicator functions from the likelihood densities of the individual $X_i$. The product of indicator functions then becomes a single indicator function operating on a combination of the $X_i$. What does this indicator function look like? What is the posterior support of $\theta$?
+
+$$
+\begin{aligned}
+p_{\theta | X_1, \dots, X_n} &\propto p_{X_1, \dots, X_n | \theta}(x_1, \dots, x_n) \cdot p_{\theta | k, m}(\theta) \\
+&\propto \frac{\mathbb{I}[0 < \max(x_1, \dots, x_n) \leq \theta]}{\theta^n} \frac{\mathbb{I}[m \leq \theta]}{\theta^{k + 1}} \\ 
+&= \frac{\mathbb{I}[0 < \max(x_1, \dots, x_n, m) \leq \theta]}{\theta^{k + n + 1}} \\
+&\propto \text{Pareto}\bigg(\max(x_1, \dots, x_n, m), k + n \bigg)
+\end{aligned}
+$$
+
+# Noisy samples from a disk of unknown radius
+
+Suppose that we obtain noisy measurements of points sampled uniformly from a circular area of unknown radius. Our goal will be to infer the radius of the circular area, $R$.
+
+Suppose further that we know in advance:
+
+1. The position of the center of the circular area; in this case it is located at the origin, $(0, 0)$.
+2. The form of the noise distribution; in this case $N(0, \sigma^2)$, with $\sigma^2$ unknown.
+3. Points that are uniformly sampled from a circular area with radius $R$ induce a uniform distribution on the squared radius $R^2$. That is, at any given angle $\omega$, the points lying along the line from $(0, 0)$ to $(R \cos\omega, R \sin \omega)$ have uniformly distributed *squared* radial magnitudes.
+4. The noise terms act additively on the squared radii; this is a bit contrived, but it will make the modeling easier, and it implies that at any given angle $\omega$, the noise perturbations will act radially outward or inward.
+
+Items 3 and 4 on the list above tells us that if we observe data drawn uniformly from the surface of a circle with radius $R$, each point's squared distance from the center of the circle will be uniformly distributed on $(0, R)$. Given these facts, let's think about how we might do inference on $R$. We will follow three steps that are critical to constructing Bayesian models and sampling algorithms.
+
+## 0. Visualize the data generating process
+
+It is often helpful to have a picture of what's going on when we describe a generative model. Here we can simulate and plot our data, overlaying the true radius $R$ on the sampled points $r_1, \dots, r_n$:
+
+```{r}
+#
+n <- 1000
+true_R <- 5
+m <- 3
+k <- 1
+alpha <- 5/2
+beta <- 5/2
+true_sigma <- 1.25
+#
+u <- runif(n, 0, true_R)
+r <- u + rnorm(n, sd = true_sigma)
+theta <- runif(n, 0, 2*pi)
+#
+ggplot2::ggplot() +
+  geom_point(data = data.frame(x = sign(r)*sqrt(abs(r))*cos(theta), y = sign(r)*sqrt(abs(r))*sin(theta)),
+             aes(x = x, y = y), shape = 1) +
+  geom_path(data = data.frame(R = true_R) %>%
+                              plyr::ddply(.(R), function(d){
+                                data.frame(x = sqrt(d$R)*cos(seq(0, 2*pi, length.out = 100)),
+                                            y = sqrt(d$R)*sin(seq(0, 2*pi, length.out = 100)))
+                              }),
+                       aes(x = x, y = y), alpha = 1, colour = "red") +
+  coord_fixed()
+```
+
+## 1. Write down the data likelihood
+
+Let $r_i$ denote the noisy squared radius of observed data point $i$. Given the noiseless squared radial positions of the points, we assume that the observations $r_i$ are normally distributed, each with mean $u_i$ and variance $\sigma^2$
+
+$$
+\begin{aligned}
+p(r | u, \sigma^2, R^2, m, k) &= \left(\frac{1}{2 \pi \sigma^2}\right)^{n/2} e^{-\frac{1}{2 \sigma^2}\sum_{i=1}^n (r_i - u_i)^2}
+\end{aligned}
+$$
+
+## 2. Write down the rest of the generative model
+
+A model for the data generating process might look something like this:
+
+$$
+\begin{aligned}
+r_i &\sim N(u_i, \sigma^2) \\
+u_i &\overset{iid}\sim U(0, R^2) \\
+\theta &\sim Pa(m, k) \\
+1 / \sigma^2 &\sim Ga(\alpha, \beta)
+\end{aligned}
+$$
+
+Here we have used the conjugate prior, the Pareto distribution, for the uniform likelihood. We have also used the conjugate Gamma prior for the precision parameter.
+
+## 3. Write down (and factorize) the joint distribution for all parameters
+
+Which parameters are independent of one another? How does this inform the way we can decompose the joint distribution of the parameters and the data? What does this decomposition imply for a Gibbs sampling algorithm that produces draws from the posterior distribution of $\theta$?
+
+$$
+\begin{aligned}
+p(r, u, 1/\sigma^2, R^2, m, k, \alpha, \beta) &= p(r | u, 1/\sigma^2, \theta, m, k) \cdot p(u | R^2) \cdot p(R^2 | m, k) \cdot p(1/\sigma^2 | \alpha, \beta)
+\end{aligned}
+$$
+
+## 4. Write down (if possible) full conditional distributions
+
+In this case, we can explicitly write out the full conditional distributions for the model parameters $u, \theta$ and $\sigma^2$. What are they? Make sure to keep track of indicator functions that may truncate the support of a density function.
+
+$$
+u_i | r_i, \sigma^2, R^2 \sim \text{Truncated Normal}\left(u_i, \sigma^2, 0, R^2 \right)
+$$
+
+$$
+1 / \sigma^2 | r, u, \alpha, \beta \sim Ga\left(n/2 + \alpha, \frac{1}{2}\sum_{i=1}^n (r_i - u_i)^2 + \beta \right)
+$$
+
+$$
+R^2 | u, m, k  \sim Pa\left(\max(u_1, \dots, u_n, m), k + n \right)
+$$
+
+# Sampling and results
+
+Now we are ready to write a Gibbs sampler using truncated full conditional distributions to make inferences about the radius parameter $R$.
+
+```{r}
+#
+rpareto <- function(m, k, trunc = NULL){
+  p <- m*(1 - runif(1))^(-1/k)
+  if(!is.null(trunc)){
+    while(p > trunc){
+      p <- m*(1 - runif(1))^(-1/k)
+    }
+  }
+  return(p)
+}
+#
+uni_pareto_gibbs <- function(S, r, m, k, alpha, beta, burn_in = min(100, S / 2), thin = 5){
+  # Reparametrize X matrix to squared radius values
+  Rsq <- r
+  n <- length(Rsq)
+  R <- rep(1, S)
+  U <- matrix(0, nrow = S, ncol = n)
+  U[1, ] <- runif(n, 0, R)
+  sigma <- rep(1, S)
+  #
+  U_curr <- U[1, ]
+  R_curr <- R[1]
+  sigma_curr <- sigma[1]
+  for(s in 1:S){
+    # Sample from full conditional of the inner radius
+    R_curr <- rpareto(max(c(U_curr, m)), k + n)
+    R[s] <- R_curr
+    # Sample from full conditional of U values
+    U_curr <- truncnorm::rtruncnorm(n, a = 0, b = R_curr, mean = Rsq, sd = sigma_curr)
+    U[s, ] <- U_curr
+    # Sample from full conditional of sigma
+    sigma_curr <- sqrt(1/rgamma(1, shape = n/2 + alpha, rate = sum((Rsq - U_curr)^2)/2 + beta))
+    sigma[s] <- sigma_curr
+  }
+  return(list(R = R[seq(burn_in, S, by = thin)], 
+              U = U[seq(burn_in, S, by = thin), ], 
+              sigma = sigma[seq(burn_in, S, by = thin)]))
+}
+#
+gibbs_samps <- uni_pareto_gibbs(S = 200000, r, m, k, alpha, beta, burn_in = 1000, thin = 100)
+```
+
+Let's visualize our samples along with the data and the true radius $R$:
+
+```{r}
+ggplot2::ggplot() +
+  geom_point(data = data.frame(x = sign(r)*sqrt(abs(r))*cos(theta), y = sign(r)*sqrt(abs(r))*sin(theta)),
+             aes(x = x, y = y), shape = 1) +
+  geom_path(data = data.frame(R = gibbs_samps$R) %>%
+                              plyr::ddply(.(R), function(d){
+                                data.frame(x = sqrt(d$R)*cos(seq(0, 2*pi, length.out = 100)),
+                                            y = sqrt(d$R)*sin(seq(0, 2*pi, length.out = 100)))
+                              }),
+                       aes(x = x, y = y), alpha = 0.005, colour = "blue") +
+  geom_path(data = data.frame(R = true_R) %>%
+                              plyr::ddply(.(R), function(d){
+                                data.frame(x = sqrt(d$R)*cos(seq(0, 2*pi, length.out = 100)),
+                                            y = sqrt(d$R)*sin(seq(0, 2*pi, length.out = 100)))
+                              }),
+                       aes(x = x, y = y), alpha = 1, colour = "red") +
+  coord_fixed()
+```
+
+We can also visualize the joint posterior density of $\sigma^2, R^2$ to see how close we got to the truth:
+
+```{r}
+p1 <- qplot(gibbs_samps$R, geom = "histogram", bins = 50, xlab = expression(R^2)) +
+      geom_vline(aes(xintercept = true_R))
+p2 <- qplot(gibbs_samps$sigma^2, geom = "histogram", bins = 50, xlab = expression(sigma^2)) +
+      geom_vline(aes(xintercept = true_sigma^2))
+p3 <- qplot(gibbs_samps$R, gibbs_samps$sigma^2, geom = "density2d", bins = 50, 
+            xlab = expression(R^2), ylab = expression(sigma^2)) +
+  geom_point(aes(x = true_R, y = true_sigma^2)) +
+  ggrepel::geom_label_repel(aes(x = true_R, y = true_sigma^2, label = "Truth"))
+cowplot::plot_grid(p1, p2, p3, nrow = 2, rel_widths = c(1, 1, 2))
+```

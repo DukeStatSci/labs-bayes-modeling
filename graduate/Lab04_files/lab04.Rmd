@@ -1,0 +1,340 @@
+---
+title: "STA 601 Lab 5: Introduction to Hamiltonian Monte Carlo"
+author: "STA 601: Bayesian Inference and Modern Statistical Methods"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+---
+
+```{r setup, message=F, warning=F, echo=F}
+#
+require(tidyverse)
+require(rstanarm)
+require(magrittr)
+require(rstan)
+require(bayesplot)
+require(loo)
+require(readxl)
+require(plyr)
+#
+ggplot2::theme_set(ggplot2::theme_bw())
+knitr::opts_chunk$set(fig.align = 'center')
+```
+
+# Overview
+
+By now you have encountered at least two procedures for generating samples from a distribution over model parameters conditional on observed data (the *posterior distribution* of your model parameters). The first method, **direct sampling**, assumes that we can explicitly write down the form of the posterior density and/or distribution function, which means that we can generate samples from it with calls to standard `R` functions. The second method, **Gibbs sampling**, generates samples from a posterior distribution by building a Markov Chain whose stationary distribution is the desired posterior. 
+
+The benefit of Gibbs sampling is that it allows us to sample from distributions whose form we may not be able to write down. The drawback is that, unlike samples directly from the posterior, samples from the Gibbs sampler *eventually* behave as if they were drawn from the posterior distribution: now we have to be concerned about exactly how and when this convergence occurs. Later in the course you will learn about diagnostics for Gibbs samplers and some methods for monitoring convergence of Markov chains. You will write your own Gibbs samplers and implement some of these methods. You will also learn that the Gibbs sampler is just a special case of a class of procedures for sampling from a posterior distribution, which fall under the title **Markov Chain Monte Carlo (MCMC)**.
+
+Before you see those details, we will spend time in this lab building intuition for the mechanics of Markov Chain Monte Carlo methods and we will use that intuition to understand the advanced methods `Stan` is running under the hood to generate its samples.
+
+# MCMC and Gibbs sampling
+
+One of the key intuitions to build when thinking about MCMC methods is that of "space exploration." In the case of two-parameter models parametrized by $\theta = [\theta_1, \theta_2] \in \mathbb{R}^2$, we can think of MCMC methods as sampling from the 2-d real-valued plane according to our target density
+
+$$
+p(\theta_1, \theta_2|X_1, \dots, X_n)
+$$
+
+MCMC methods like the Gibbs sampler will move iteratively through the plane, transitioning from point to point and producing a set of $S$ samples
+
+$$
+[\theta^{(1)}_1, \theta^{(1)}_2], \dots, [\theta^{(S)}_1, \theta^{(S)}_2]
+$$
+
+When the target density is nicely behaved, the exploration of a Gibbs sampler is also "nice." Regions of high density are visited with higher frequency than regions of lower density. All regions of the plane are both in theory *and* in practice accessible within a finite (and relatively small) number of transition steps. An example of a nice density on $\mathbb{R}^2$ is a bivariate normal with a modest degree of dependence between its two components $\theta_1, \theta_2$:
+
+```{r, echo = F}
+theta_1 <- seq(-3, 3, length.out = 250)
+theta_2 <- seq(-3, 3, length.out = 250)
+expand.grid(theta_1 = theta_1, theta_2 = theta_2) %>%
+  ggplot2::ggplot() +
+  geom_tile(aes(x = theta_1, y = theta_2, fill = dnorm(theta_1)*dnorm(theta_2)*(exp(0.25*theta_1*theta_2)))) +
+  stat_contour(aes(x = theta_1, y = theta_2, z = dnorm(theta_1)*dnorm(theta_2)*(exp(0.25*theta_1*theta_2)))) +
+  theme_minimal() +
+  scale_fill_distiller(palette = "Spectral", name = "Density") +
+  labs(x = expression(theta[1]), y = expression(theta[2])) +
+  coord_fixed()
+```
+
+What's an example of a "not nice" density for moving through the plane with Gibbs transition steps? Let's look at an example of a bivariate density that would likely give the Gibbs sampler some trouble:
+
+```{r, echo = F}
+theta_1 <- seq(-3, 3, length.out = 250)
+theta_2 <- seq(-3, 3, length.out = 250)
+expand.grid(theta_1 = theta_1, theta_2 = theta_2) %>%
+  ggplot2::ggplot() +
+  geom_tile(aes(x = theta_1, y = theta_2, 
+                fill = dnorm(0, mean = (theta_1^2 + theta_2^2) + theta_1/(theta_1^2 + theta_2^2)))) +
+  stat_contour(aes(x = theta_1, y = theta_2, z = dnorm(0, mean = (theta_1^2 + theta_2^2) + theta_1/(theta_1^2 + theta_2^2)))) +
+  theme_minimal() +
+  scale_fill_distiller(palette = "Spectral", name = "Density") +
+  labs(x = expression(theta1[1]), y = expression(theta1[2])) +
+  coord_fixed()
+```
+
+The problem here is that there are regions with very high density (the red peaks in the middle) right next to regions of very low density. It will take many transition steps for the Markov Chain to reach the peaks, and will also take many transitions to get out of the neighborhood of the peaked regions once it moves near it.
+
+While the asymptotic properties of the Markov chain still hold, the sticking behavior makes it difficult to get accurate posterior summaries without taking an infinite number of samples and waiting an infinitely long time for them. As with many other problems in statistics, this problem often gets worse as the number of dimensions in the parameter space increases.
+
+# Gibbs failure modes
+
+Even less extreme examples than the one shown above will cause Gibbs samplers to explore the sample space more slowly than we'd like. Let's look at a simpler case and write the code for our own Gibbs sampler. Later we will compare it to Stan's behavior on the same problem and discuss the benefits of using HMC.
+
+Consider data generated from a bivariate normal distribution with mean parameters $\theta_1, \theta_2$ and known covariance matrix $\Sigma$ and suppose we place independent normal priors on $\theta_1, \theta_2$:
+
+$$
+\begin{aligned}
+X_1, \dots, X_n &\sim N \left(\theta, \Sigma \right) \\
+\theta_j &\sim N(0, 1)~~~~~~j=1,2
+\end{aligned}
+$$
+
+Suppose too that the covariance matrix $\Sigma$ has a specific form with unit-variance marginal distributions and known correlation parameter $\rho$:
+
+$$
+\Sigma = 
+\left[\begin{array}{cc}
+1 & \rho \\
+\rho & 1
+\end{array}\right]
+$$
+
+In this course you have derived (or will derive) the multivariate posterior density $p(\theta | \Sigma, X)$. However, for the purposes of this exercise, we will sample from the full conditional densities
+
+$$
+p(\theta_1 | X_1, \dots, X_n, \rho, \theta_2) \\
+p(\theta_2 | X_1, \dots, X_n, \rho, \theta_1)
+$$
+
+This way, we can explore a toy example of where Gibbs sampling faces issues, which provides an analogy to situations one might encounter in practice when direct sampling methods are not available.
+
+***
+### Exercise
+
+Before building the Gibbs sampler to make inferences on $\theta_1, \theta_2$, first answer these questions:
+
+1. What is the conditional density $p(\theta_1 | X_1, \dots, X_n, \rho, \theta_2)$?
+2. What is the conditional density $p(\theta_2 | X_1, \dots, X_n, \rho, \theta_1)$?
+
+The full conditionals are:
+
+$$
+\begin{aligned}
+\theta_1 | X_1, \dots, X_n, \rho, \theta_2 &\sim N\left(\frac{\sum_{i} X_{i1} + \rho(n\theta_2 - \sum_{i} X_{i2})}{n+1-\rho^2}, ~(1-\rho^2)/(n+1-\rho^2) \right) \\
+\theta_2 | X_1, \dots, X_n, \rho, \theta_1 &\sim N\left(\frac{\sum_{i} X_{i2} + \rho(n\theta_1 - \sum_{i} X_{i1})}{n+1-\rho^2}, ~(1-\rho^2)/(n+1-\rho^2)\right)
+\end{aligned}
+$$
+
+***
+
+Now that you have derived the full condition densities, write some code to implement a Gibbs sampler for this model.
+
+***
+### Exercise
+
+Specifically, write a function called `normal_gibbs_sampler` that takes as arguments (1) the number of samples desired (`S`), (2) an $n \times 2$ matrix of data values (`X`), and (3) the given correlation parameter (`rho`). Have this function return an $S \times 2$ matrix of samples containing $[\theta^{(1)}_1, \theta^{(1)}_2], \dots, [\theta^{(S)}_1, \theta^{(S)}_2]$, your realizations from the joint posterior $p(\theta | X_1, \dots, X_n, \rho)$.
+
+```{r}
+normal_gibbs_sampler <- function(S, X, rho){
+  theta_1 <- rep(0, S)
+  theta_2 <- rep(0, S)
+  n <- nrow(X)
+  for(s in 2:S){
+    theta_1[s] <- rnorm(1, 
+                        mean = (sum(X[,1]) + rho*(n*theta_2[s-1] - sum(X[,2]))) /
+                                (n + 1 - rho^2), 
+                        sd = sqrt((1 - rho^2)/(n + 1 - rho^2)))
+    theta_2[s] <- rnorm(1,
+                        mean = (sum(X[,2]) + rho*(n*theta_1[s] - sum(X[,1]))) /
+                                (n + 1 - rho^2), 
+                        sd = sqrt((1 - rho^2)/(n + 1 - rho^2)))
+  }
+  return(cbind(theta_1, theta_2))
+}
+```
+
+***
+
+With the Gibbs sampling code in hand, let's generate samples from the posterior distribution of $\theta_1, \theta_2$ with $\rho = 0.2$. We'll do the same using `Stan`.
+
+```{r, message=F, warning=F}
+n <- 100
+rho <- 0.2
+X <- MASS::mvrnorm(n = n, mu = c(2, 4), Sigma = matrix(c(1, rho, rho, 1), nrow = 2))
+Sigma_post <- matrix(((1-rho^2)/((n+1-rho^2)^2 - (n^2)*(rho^2)))*c(n+1-rho^2, n*rho, n*rho, n+1-rho^2), nrow = 2)
+mu_post <- n*Sigma_post%*%matrix(c(1/(1-rho^2), -rho/(1-rho^2), 
+                                                       -rho/(1-rho^2), 1/(1-rho^2)), 
+                                                       nrow = 2)%*%colMeans(X)
+norm_gibbs_samps <- normal_gibbs_sampler(600, X, rho)
+#
+true_post <- MASS::mvrnorm(n = 100000, 
+                           mu = mu_post, 
+                           Sigma = Sigma_post)
+data.frame(norm_gibbs_samps) %>%
+  magrittr::set_colnames(c("theta_1", "theta_2")) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  dplyr::filter(iter > 100) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  ggplot2::ggplot() +
+  geom_density2d(data = data.frame(true_post) %>%
+                        magrittr::set_colnames(c("true_1", "true_2")),
+                 aes(x = true_1, y = true_2)) +
+  geom_path(aes(x = theta_1, y = theta_2, colour = iter), alpha = 0.2, size = 0.5) +
+  geom_point(aes(x = theta_1, y = theta_2, colour = iter), size = 0.5) +
+  scale_color_distiller(palette = "Spectral", name = "Iter") +
+  labs(x = expression(theta[1]), y = expression(theta[2])) +
+  xlim(c(mu_post[1] - 0.5, mu_post[1] + 0.5)) +
+  ylim(c(mu_post[2] - 0.5, mu_post[2] + 0.5))
+#
+stan_res <- rstan::stan("hmc_norm_example.stan", data = list(X = X, 
+                                                             N = nrow(X), 
+                                                             Sigma = matrix(c(1, rho, rho, 1), nrow = 2)),
+                        chains = 1, iter = 600, warmup = 100, verbose = F, refresh = 0) %>%
+            rstan::extract()
+#
+data.frame(stan_res$theta) %>%
+  magrittr::set_colnames(c("theta_1", "theta_2")) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  ggplot2::ggplot() +
+  geom_density2d(data = data.frame(true_post) %>%
+                        magrittr::set_colnames(c("true_1", "true_2")),
+                 aes(x = true_1, y = true_2)) +
+  geom_path(aes(x = theta_1, y = theta_2, colour = iter), alpha = 0.2, size = 0.5) +
+  geom_point(aes(x = theta_1, y = theta_2, colour = iter), size = 0.5) +
+  scale_color_distiller(palette = "Spectral", name = "Iter") +
+  labs(x = expression(theta[1]), y = expression(theta[2])) +
+  xlim(c(mu_post[1] - 0.5, mu_post[1] + 0.5)) +
+  ylim(c(mu_post[2] - 0.5, mu_post[2] + 0.5))
+#
+par(mfrow = c(1,2))
+acf(norm_gibbs_samps[,1])
+acf(norm_gibbs_samps[,2])
+#
+par(mfrow = c(1,2))
+acf(stan_res$theta[,1])
+acf(stan_res$theta[,2])
+
+```
+
+
+The Gibbs sampling results and the HMC results look pretty similar! What happens when $\rho = 0.995$?
+
+```{r, message=F, warning=F}
+n <- 100
+rho <- 0.995
+X <- MASS::mvrnorm(n = n, mu = c(2, 4), Sigma = matrix(c(1, rho, rho, 1), nrow = 2))
+Sigma_post <- matrix(((1-rho^2)/((n+1-rho^2)^2 - (n^2)*(rho^2)))*c(n+1-rho^2, n*rho, n*rho, n+1-rho^2), nrow = 2)
+mu_post <- n*Sigma_post%*%matrix(c(1/(1-rho^2), -rho/(1-rho^2), 
+                                                       -rho/(1-rho^2), 1/(1-rho^2)), 
+                                                       nrow = 2)%*%colMeans(X)
+norm_gibbs_samps <- normal_gibbs_sampler(600, X, rho)
+#
+true_post <- MASS::mvrnorm(n = 100000, 
+                           mu = n*Sigma_post%*%(matrix(c(1/(1-rho^2), -rho/(1-rho^2), 
+                                                       -rho/(1-rho^2), 1/(1-rho^2)), 
+                                                       nrow = 2)%*%colMeans(X)), 
+                           Sigma = Sigma_post)
+#
+data.frame(norm_gibbs_samps) %>%
+  magrittr::set_colnames(c("theta_1", "theta_2")) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  dplyr::filter(iter > 100) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  ggplot2::ggplot() +
+  geom_density2d(data = data.frame(true_post) %>%
+                        magrittr::set_colnames(c("true_1", "true_2")),
+                 aes(x = true_1, y = true_2)) +
+  geom_path(aes(x = theta_1, y = theta_2, colour = iter), alpha = 0.2, size = 0.5) +
+  geom_point(aes(x = theta_1, y = theta_2, colour = iter), size = 0.5) +
+  scale_color_distiller(palette = "Spectral", name = "Iter") +
+  labs(x = expression(theta[1]), y = expression(theta[2])) +
+  xlim(c(mu_post[1] - 0.5, mu_post[1] + 0.5)) +
+  ylim(c(mu_post[2] - 0.5, mu_post[2] + 0.5))
+#
+stan_res <- rstan::stan("hmc_norm_example.stan", data = list(X = X, 
+                                                             N = nrow(X), 
+                                                             Sigma = matrix(c(1, rho, rho, 1), nrow = 2)),
+                        chains = 1, iter = 600, warmup = 100, verbose = F, refresh = 0) %>%
+            rstan::extract()
+data.frame(stan_res$theta) %>%
+  magrittr::set_colnames(c("theta_1", "theta_2")) %>%
+  dplyr::mutate(iter = 1:n()) %>%
+  ggplot2::ggplot() +
+  geom_density2d(data = data.frame(true_post) %>%
+                        magrittr::set_colnames(c("true_1", "true_2")),
+                 aes(x = true_1, y = true_2)) +
+  geom_path(aes(x = theta_1, y = theta_2, colour = iter), alpha = 0.2, size = 0.5) +
+  geom_point(aes(x = theta_1, y = theta_2, colour = iter), size = 0.5) +
+  scale_color_distiller(palette = "Spectral", name = "Iter") +
+  labs(x = expression(theta[1]), y = expression(theta[2])) +
+  xlim(c(mu_post[1] - 0.5, mu_post[1] + 0.5)) +
+  ylim(c(mu_post[2] - 0.5, mu_post[2] + 0.5))
+#
+par(mfrow = c(1,2))
+acf(norm_gibbs_samps[,1])
+acf(norm_gibbs_samps[,2])
+#
+par(mfrow = c(1,2))
+acf(stan_res$theta[,1])
+acf(stan_res$theta[,2])
+```
+
+***
+### Exercise
+
+Please answer these questions:
+
+1. How do the results of the Gibbs sampler differ from those obtained from HMC?
+2. Why do the samples from the Gibbs sampler exhibit this behavior?
+
+***
+
+# Hamiltonian Monte Carlo (HMC)
+
+To learn the ins and outs of HMC, please read Michael Betancourt's [A Conceptual Introduction to Hamiltonian Monte Carlo](https://arxiv.org/pdf/1701.02434.pdf). For now, we will limit ourselves to a few key details:
+
+### 1. HMC encourages better Markov Transitions
+
+Hamiltonian Monte Carlo methods are like other MCMC methods in that they create Markov Chains that converge to the target distribution. The difference lies in how transitions from state to state are chosen. HMC creates transitions that *efficiently explore the parameter space* by using concepts from Hamiltonian mechanics.
+
+### 2. Hamilton's equations and "phase space"
+
+In Hamiltonian mechanics, a physical system is completely specified by positions ($\mathbf{q}$) and momenta ($\mathbf{p}$). A space defined by these coortinates is called "phase space." If the parameters of interest in a typical MCMC method are denoted as $q_1, \dots, q_K$, then HMC introduces auxiliary "momentum" parameters $p_1, \dots, p_K$ such that the algorithm produces draws from the joint density:
+
+$$
+\pi(\mathbf{q}, \mathbf{p}) = \pi (\mathbf{p} | \mathbf{q}) \pi(\mathbf{q})
+$$
+
+Note that if we marginalize over the $p_k$'s, we recover the marginal distribution of the $q_k$'s. Therefore, if we create a Markov Chain that converges to $\pi(\mathbf{q}, \mathbf{p})$, we have immediate access to samples from $\pi(\mathbf{q})$, which is our target distribution.
+
+At each iteration of the sampling algorithm, HMC implementations make draws from some distribution $\pi(\mathbf{p} | \mathbf{q})$ (often it is actually independent of $\mathbf{q}$; the choice of momentum distribution is important but not discussed here) and then *evolve the system* $(\mathbf{p}, \mathbf{q})$ to obtain the next sample of $\mathbf{q}$. What does that mean?
+
+Hamilton's equations describe the time evolution of the system in terms of the **Hamiltonian**, $\mathcal{H}$, which usually corresponds to the total energy of the system:
+
+$$
+\begin{align}
+\frac{d \mathbf{p}}{dt} &= - \frac{\partial \mathcal{H}}{\partial \mathbf{q}} = -\frac{\partial K}{\partial \mathbf{q}} - \frac{\partial V}{\partial \mathbf{q}} \\
+\frac{d \mathbf{q}}{dt} &= +\frac{\partial \mathcal{H}}{\partial \mathbf{p}} = +\frac{\partial K}{\partial \mathbf{p}} \\\\
+\mathcal{H}(\mathbf{p},\mathbf{q}) &= K(\mathbf{p}, \mathbf{q}) + V(\mathbf{q})
+\end{align}
+$$
+
+Here $K(\mathbf{p}, \mathbf{q})$ represents the **kinetic energy** of the system and $V(\mathbf{q})$ represents the **potential energy** of the system. HMC samplers set the kinetic energy component equal to the negative logarithm of the momentum distribution, and set the potential energy component equal to the negative logarithm of distribution over the target parameters.
+
+To "evolve the system" is to move $(\mathbf{p}, \mathbf{q})$ forward in "time," i.e. to change the values of $(\mathbf{p}, \mathbf{q})$ according to Hamilton's differential equations. If one stares long enough, one can see that the first equation corresponds to saying:
+
+> "The differential change in momentum parameters over time is governed in part by the differential information of the density over the target parameters."
+
+In some sense, moving $(\mathbf{p}, \mathbf{q})$ forward in time according to Hamilton's equations changes the parameters in a way that is "guided" by the gradient of the target distribution.
+
+### 3. So what does Stan do?
+
+Stan uses HMC sampling. So under the hood, it is
+
+1. Sampling parameters $\mathbf{p}_t, \mathbf{q}_t$.
+2. Evolving $\mathbf{p}_{t}, \mathbf{q}_t$ forward in time according to Hamilton's equations to obtain $\mathbf{p}_{t+1}, \mathbf{q}_{t+1}$.
+3. Repeating.
+
+There are *many* more details to HMC, but this is the gist.
+
